@@ -70,6 +70,14 @@ class EmbodimentTag(Enum):
     Raw action: psm1_pose(7D) + psm1_gripper(1D) + psm2_pose(7D) + psm2_gripper(1D) = 16D.
     """
 
+    SUTUREBOT = "suturebot"
+    """
+    The JHU SutureBot dataset (dVRK, pre-concatenated LeRobot format).
+    Dual-arm (PSM1/PSM2) with pre-concatenated actions in a single 'action.action' key.
+    Raw action: arm1(xyz(3) + rot6d(6) + gripper(1)) + arm2(same) = 20D.
+    Uses RelativeActionTransform for delta conversion.
+    """
+
     JHU_DVRK_MONO = "jhu_dvrk_mono"
     """
     Monocular JHU dVRK surgical robot variant.

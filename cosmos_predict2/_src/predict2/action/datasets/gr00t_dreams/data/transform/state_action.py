@@ -1434,3 +1434,97 @@ class GenericRelativeActionTransform(ModalityTransform):
                 data[key] = action_np
 
         return data
+
+
+# =============================================================================
+# SutureBot / dVRK Relative Action Transform
+# =============================================================================
+# Handles the pre-concatenated 20D dual-arm dVRK action format used by the
+# SutureBot dataset:
+#   Per arm: [xyz(3), rot6d(6), gripper(1)] = 10D
+#   Dual-arm: arm1(10D) + arm2(10D) = 20D
+#
+# Computes global translation deltas and local rotation deltas (rot6d) relative
+# to the base pose at t=0. Based on Stanford UMI's relative action formulation.
+# =============================================================================
+
+
+def _rotation_6d_to_matrix(rot6d):
+    """Convert 6D rotation (first two rows of rotation matrix) to full 3x3 matrix.
+
+    Uses Gram-Schmidt orthonormalization on the input rows.
+
+    Args:
+        rot6d: Array of shape (..., 6) containing [row1(3), row2(3)].
+
+    Returns:
+        Rotation matrices of shape (..., 3, 3).
+    """
+    shape = rot6d.shape[:-1]
+    rot6d = rot6d.reshape(*shape, 2, 3)
+
+    row1 = rot6d[..., 0, :]
+    row1 = row1 / (np.linalg.norm(row1, axis=-1, keepdims=True) + 1e-8)
+
+    row2 = rot6d[..., 1, :]
+    row2 = row2 - np.sum(row1 * row2, axis=-1, keepdims=True) * row1
+    row2 = row2 / (np.linalg.norm(row2, axis=-1, keepdims=True) + 1e-8)
+
+    row3 = np.cross(row1, row2)
+
+    return np.stack([row1, row2, row3], axis=-2)
+
+
+def _compute_rel_actions_dvrk(actions):
+    """Compute relative actions for a dual-arm dVRK robot.
+
+    Global translation delta, local (tooltip frame) rotation delta in 6D format.
+    actions[0] is the base pose, actions[1:] are targets.
+
+    Input/output per-arm: [xyz(3), rot6d(6), gripper(1)] = 10D
+    Dual-arm: [T, 20] → [T-1, 20]
+
+    The relative rotation R_rel = R_base^T @ R_target is represented in 6D
+    (first two rows of the rotation matrix, flattened).
+    """
+    if isinstance(actions, torch.Tensor):
+        actions = actions.numpy()
+
+    base = actions[0]
+    targets = actions[1:]
+    n_targets = targets.shape[0]
+    rel_actions = np.zeros((n_targets, 20))
+
+    for arm in range(2):
+        i = arm * 10
+        R_base = _rotation_6d_to_matrix(base[i + 3 : i + 9])
+        R_tgt = _rotation_6d_to_matrix(targets[:, i + 3 : i + 9])
+
+        rel_actions[:, i : i + 3] = targets[:, i : i + 3] - base[i : i + 3]
+        R_rel = R_base.T @ R_tgt
+        rel_actions[:, i + 3 : i + 9] = R_rel[:, :2, :].reshape(n_targets, 6)
+        rel_actions[:, i + 9] = targets[:, i + 9]
+
+    return rel_actions
+
+
+class RelativeActionTransform(ModalityTransform):
+    """Convert absolute actions to relative actions for dVRK/SutureBot datasets.
+
+    Works on the pre-concatenated 20D dual-arm action vector (``action.action``).
+    Input: [T, 20] absolute (xyz + rot6d + gripper per arm).
+    Output: [T-1, 20] relative (delta_xyz + delta_rot6d + gripper per arm).
+    """
+
+    apply_to: list[str] = Field(..., description="Action keys to transform.")
+
+    def apply(self, data: dict[str, Any]) -> dict[str, Any]:
+        for key in self.apply_to:
+            if key not in data:
+                continue
+            actions = data[key]
+            is_tensor = isinstance(actions, torch.Tensor)
+            actions_np = actions.numpy() if is_tensor else actions
+            rel_actions = _compute_rel_actions_dvrk(actions_np)
+            data[key] = torch.from_numpy(rel_actions).to(actions.dtype) if is_tensor else rel_actions
+        return data

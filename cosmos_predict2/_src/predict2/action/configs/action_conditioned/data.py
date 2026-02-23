@@ -309,6 +309,51 @@ open_h_multi_val_dataloader = L(DataLoader)(
 )
 
 
+# ============================================================================
+# SutureBot Dataset Configuration
+# ============================================================================
+# JHU SutureBot (dVRK) in pre-concatenated LeRobot format.
+# 20D actions (dual-arm: xyz + rot6d + gripper per arm) are zero-padded to
+# MAX_ACTION_DIM (44D) via MixedLeRobotDataset to match the Open-H model.
+# Default path assumes container mount at /SutureBot; override in SLURM script.
+# ============================================================================
+from cosmos_predict2._src.predict2.action.datasets.gr00t_dreams.data.embodiment_tags import EmbodimentTag
+
+SUTUREBOT_DATASET_SPECS: list[dict] = [
+    {"path": "/SutureBot", "embodiment": EmbodimentTag.SUTUREBOT, "mix_ratio": 1.0},
+]
+
+suturebot_train_dataset = L(MixedLeRobotDataset)(
+    dataset_specs=SUTUREBOT_DATASET_SPECS,
+    num_frames=13,
+    data_split="train",
+    max_action_dim=MAX_ACTION_DIM,
+    downscaled_res=False,
+)
+
+suturebot_val_dataset = L(MixedLeRobotDataset)(
+    dataset_specs=SUTUREBOT_DATASET_SPECS,
+    num_frames=13,
+    data_split="test",
+    max_action_dim=MAX_ACTION_DIM,
+    downscaled_res=False,
+)
+
+suturebot_train_dataloader = L(DataLoader)(
+    dataset=suturebot_train_dataset,
+    sampler=L(get_sampler)(dataset=suturebot_train_dataset),
+    batch_size=1,
+    drop_last=True,
+)
+
+suturebot_val_dataloader = L(DataLoader)(
+    dataset=suturebot_val_dataset,
+    sampler=L(get_sampler)(dataset=suturebot_val_dataset),
+    batch_size=1,
+    drop_last=True,
+)
+
+
 def register_training_and_val_data():
     cs = ConfigStore.instance()
     from cosmos_predict2._src.predict2.configs.common.mock_data import MOCK_DATA_INTERLEAVE_CONFIG
@@ -400,6 +445,22 @@ def register_training_and_val_data():
         package="dataloader_val",
         name="open_h_multi_val",
         node=open_h_multi_val_dataloader,
+    )
+
+    # ============================================================================
+    # SutureBot dataset (20D actions zero-padded to 44D)
+    # ============================================================================
+    cs.store(
+        group="data_train",
+        package="dataloader_train",
+        name="suturebot_train",
+        node=suturebot_train_dataloader,
+    )
+    cs.store(
+        group="data_val",
+        package="dataloader_val",
+        name="suturebot_val",
+        node=suturebot_val_dataloader,
     )
 
     # Register gr00t_customized_gr1 data

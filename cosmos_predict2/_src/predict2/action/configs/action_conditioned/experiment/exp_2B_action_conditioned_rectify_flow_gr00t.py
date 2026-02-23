@@ -910,6 +910,48 @@ AC_CHUNK_SINGLE_VIEW_2B_OPEN_H_13FRAME_8NODES_OSS = LazyDict(
 )
 
 
+# =============================================================================
+# SutureBot downstream finetuning from Cosmos-H-Surgical-Simulator (Open-H)
+# =============================================================================
+# Finetunes the Open-H pre-trained model (44D action conditioning) on SutureBot.
+# SutureBot's 20D actions are zero-padded to 44D by MixedLeRobotDataset.
+# Loads from the Open-H experiment checkpoint (strict_resume=False to allow
+# the action MLP to accommodate the padded dimensions gracefully).
+# =============================================================================
+AC_CHUNK_SINGLE_VIEW_2B_SUTUREBOT_13FRAME_NODES_OSS = LazyDict(
+    dict(
+        defaults=[
+            "/experiment/2b_bridge_action_conditioned_oss",
+            {"override /net": "cosmos_v1_2B_action_chunk_conditioned"},
+            {"override /data_train": "suturebot_train"},
+            {"override /data_val": "suturebot_val"},
+            "_self_",
+        ],
+        job=dict(
+            group="official_runs_vid2vid",
+            name="cosmos_predict2p5_2B_action_conditioned_suturebot_13frame_4nodes_release_oss",
+            project="cosmos_predict2_action_conditioned",
+        ),
+        model=dict(
+            config=dict(
+                state_t=1 + 12 // 4,
+                net=dict(
+                    action_dim=44,  # 20D SutureBot actions zero-padded to 44D (Open-H unified)
+                ),
+            ),
+        ),
+        dataloader_train=dict(
+            batch_size=4,
+        ),
+        optimizer=dict(
+            lr=4e-5,
+            weight_decay=0.1,
+        ),
+    ),
+    flags={"allow_objects": True},
+)
+
+
 cs = ConfigStore.instance()
 
 for _item, _item_wo_resume, _item_mock_wo_resume in [
@@ -958,6 +1000,10 @@ for _item, _item_wo_resume, _item_mock_wo_resume in [
     [
         AC_CHUNK_SINGLE_VIEW_2B_OPEN_H_13FRAME_8NODES_OSS,
         *build_debug_runs(AC_CHUNK_SINGLE_VIEW_2B_OPEN_H_13FRAME_8NODES_OSS),
+    ],
+    [
+        AC_CHUNK_SINGLE_VIEW_2B_SUTUREBOT_13FRAME_NODES_OSS,
+        *build_debug_runs(AC_CHUNK_SINGLE_VIEW_2B_SUTUREBOT_13FRAME_NODES_OSS),
     ],
 ]:
     cs.store(group="experiment", package="_global_", name=f"{_item['job']['name']}", node=_item)

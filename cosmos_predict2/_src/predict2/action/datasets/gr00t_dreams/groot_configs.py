@@ -22,6 +22,7 @@ from cosmos_predict2._src.predict2.action.datasets.gr00t_dreams.data.transform.s
     ActionKeyConfig,
     CMRVersiusRelativeActionTransform,
     GenericRelativeActionTransform,
+    RelativeActionTransform,
     StateActionToTensor,
     StateActionTransform,
 )
@@ -870,6 +871,32 @@ def construct_modality_config_and_transforms(num_frames, embodiment, downscaled_
         }
 
     # =========================================================================
+    # SutureBot (JHU dVRK, pre-concatenated LeRobot format)
+    # =========================================================================
+    # SutureBot uses a single concatenated action key 'action.action' (20D)
+    # with dual-arm dVRK data: [arm1: xyz(3)+rot6d(6)+gripper(1)] × 2.
+    # Uses RelativeActionTransform for delta conversion (different from the
+    # per-key GenericRelativeActionTransform used by EMBODIMENT_REGISTRY entries).
+    # =========================================================================
+    elif embodiment == "suturebot":
+        timestep_interval = 3
+        delta_indices = list(range(0, num_frames * timestep_interval, timestep_interval))
+        config = {
+            "video": ModalityConfig(
+                delta_indices=delta_indices,
+                modality_keys=["video.observation.images.main"],
+            ),
+            "state": ModalityConfig(
+                delta_indices=[0],
+                modality_keys=["state.observation.state"],
+            ),
+            "action": ModalityConfig(
+                delta_indices=delta_indices,
+                modality_keys=["action.action"],
+            ),
+        }
+
+    # =========================================================================
     # Registry-based embodiments (all non-CMR Open-H datasets)
     # =========================================================================
     if embodiment in EMBODIMENT_REGISTRY:
@@ -892,6 +919,10 @@ def construct_modality_config_and_transforms(num_frames, embodiment, downscaled_
         # Using 512x288 for fast PoC training while maintaining 16:9 aspect ratio
         # For production: consider 768x432 or 1280x720 (matches Cosmos 720p pretrain)
         # cf. https://docs.google.com/presentation/d/1G0mqiQRBQohDAMjMG6hpLzPVCZi3KbJxHSi4LXMJl5A/edit?slide=id.g3b869a60288_1_50#slide=id.g3b869a60288_1_50
+        width = 512 if not downscaled_res else 256
+        height = 288 if not downscaled_res else 256
+    elif embodiment == "suturebot":
+        # SutureBot: same resolution as CMR Versius (512x288, 16:9)
         width = 512 if not downscaled_res else 256
         height = 288 if not downscaled_res else 256
 
@@ -1080,6 +1111,54 @@ def construct_modality_config_and_transforms(num_frames, embodiment, downscaled_
                     video_concat_order=video_modality.modality_keys,
                     state_concat_order=cmr_state_output_keys,
                     action_concat_order=cmr_action_output_keys,
+                ),
+            ]
+        )
+    elif embodiment == "suturebot":
+        # SutureBot uses pre-concatenated 20D actions with RelativeActionTransform.
+        # Pipeline: ToTensor → RelativeAction (absolute→relative) → Normalize → Concat
+        train_transform = ComposedModalityTransform(
+            transforms=[
+                VideoToTensor(apply_to=video_modality.modality_keys),
+                VideoCrop(apply_to=video_modality.modality_keys, scale=0.95),
+                VideoResize(apply_to=video_modality.modality_keys, height=height, width=width, interpolation="linear"),
+                StateActionToTensor(apply_to=state_modality.modality_keys),
+                StateActionTransform(
+                    apply_to=state_modality.modality_keys,
+                    normalization_modes={key: "mean_std" for key in state_modality.modality_keys},
+                ),
+                StateActionToTensor(apply_to=action_modality.modality_keys),
+                RelativeActionTransform(apply_to=action_modality.modality_keys),
+                StateActionTransform(
+                    apply_to=action_modality.modality_keys,
+                    normalization_modes={key: "mean_std" for key in action_modality.modality_keys},
+                ),
+                ConcatTransform(
+                    video_concat_order=video_modality.modality_keys,
+                    state_concat_order=state_modality.modality_keys,
+                    action_concat_order=action_modality.modality_keys,
+                ),
+            ]
+        )
+        test_transform = ComposedModalityTransform(
+            transforms=[
+                VideoToTensor(apply_to=video_modality.modality_keys),
+                VideoResize(apply_to=video_modality.modality_keys, height=height, width=width, interpolation="linear"),
+                StateActionToTensor(apply_to=state_modality.modality_keys),
+                StateActionTransform(
+                    apply_to=state_modality.modality_keys,
+                    normalization_modes={key: "mean_std" for key in state_modality.modality_keys},
+                ),
+                StateActionToTensor(apply_to=action_modality.modality_keys),
+                RelativeActionTransform(apply_to=action_modality.modality_keys),
+                StateActionTransform(
+                    apply_to=action_modality.modality_keys,
+                    normalization_modes={key: "mean_std" for key in action_modality.modality_keys},
+                ),
+                ConcatTransform(
+                    video_concat_order=video_modality.modality_keys,
+                    state_concat_order=state_modality.modality_keys,
+                    action_concat_order=action_modality.modality_keys,
                 ),
             ]
         )
