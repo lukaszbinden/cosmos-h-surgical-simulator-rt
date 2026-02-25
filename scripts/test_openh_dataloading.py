@@ -45,8 +45,6 @@ Usage:
 """
 
 import argparse
-import json
-import os
 import time
 import warnings
 from pathlib import Path
@@ -65,10 +63,10 @@ from cosmos_predict2._src.predict2.action.datasets.gr00t_dreams.groot_configs im
     construct_modality_config_and_transforms,
 )
 
-
 # ============================================================================
 # Helpers
 # ============================================================================
+
 
 def _resolve_embodiment(spec_emb) -> str:
     if isinstance(spec_emb, EmbodimentTag):
@@ -88,6 +86,7 @@ def _check_file(path: Path, label: str) -> bool:
 # ============================================================================
 # Test 1: File existence checks per dataset
 # ============================================================================
+
 
 def test_dataset_files(dataset_path: Path, embodiment: str) -> dict:
     """Check that all required files exist for a dataset."""
@@ -137,6 +136,7 @@ def test_dataset_files(dataset_path: Path, embodiment: str) -> dict:
 # Test 2: Single-dataset loading
 # ============================================================================
 
+
 def test_single_dataset_loading(
     dataset_path: Path,
     embodiment: str,
@@ -151,7 +151,9 @@ def test_single_dataset_loading(
     results = {"path": str(dataset_path), "embodiment": embodiment, "issues": []}
 
     config, train_transform, test_transform = construct_modality_config_and_transforms(
-        num_frames=13, embodiment=embodiment, downscaled_res=False,
+        num_frames=13,
+        embodiment=embodiment,
+        downscaled_res=False,
     )
     modality_filename = None
     if isinstance(config, dict) and "modality_filename" in config:
@@ -228,6 +230,7 @@ def test_single_dataset_loading(
 # Test 3: Action normalization + 44D padding verification (per dataset)
 # ============================================================================
 
+
 def test_action_normalization_and_padding(
     dataset_path: Path,
     embodiment: str,
@@ -254,7 +257,9 @@ def test_action_normalization_and_padding(
     results = {"path": str(dataset_path), "embodiment": embodiment, "issues": []}
 
     config, train_transform, _ = construct_modality_config_and_transforms(
-        num_frames=13, embodiment=embodiment, downscaled_res=False,
+        num_frames=13,
+        embodiment=embodiment,
+        downscaled_res=False,
     )
     modality_filename = None
     if isinstance(config, dict) and "modality_filename" in config:
@@ -345,9 +350,7 @@ def test_action_normalization_and_padding(
         # (some outliers are fine, but all values in [-100, 100] is suspicious)
         extreme_dims = np.sum((global_min < -100) | (global_max > 100))
         if extreme_dims > 0:
-            results["issues"].append(
-                f"Normalization suspect: {extreme_dims}/{raw_dim} dims have range > [-100, 100]"
-            )
+            results["issues"].append(f"Normalization suspect: {extreme_dims}/{raw_dim} dims have range > [-100, 100]")
 
         results["action_range"] = f"[{np.min(global_min):.2f}, {np.max(global_max):.2f}]"
         results["action_mean_range"] = f"[{np.min(global_mean):.4f}, {np.max(global_mean):.4f}]"
@@ -364,6 +367,7 @@ def test_action_normalization_and_padding(
 # ============================================================================
 # Test 4: Cross-dataset action consistency (44D padding + distribution check)
 # ============================================================================
+
 
 def test_cross_dataset_consistency(num_samples_per_dataset: int = 5) -> dict:
     """Verify that all datasets produce consistent 44D padded action vectors.
@@ -386,12 +390,14 @@ def test_cross_dataset_consistency(num_samples_per_dataset: int = 5) -> dict:
         dp = Path(spec["path"])
         if not dp.exists():
             continue
-        specs.append({
-            "path": spec["path"],
-            "embodiment": emb,
-            "mix_ratio": spec.get("mix_ratio", 1.0),
-            "exclude_splits": spec.get("exclude_splits"),
-        })
+        specs.append(
+            {
+                "path": spec["path"],
+                "embodiment": emb,
+                "mix_ratio": spec.get("mix_ratio", 1.0),
+                "exclude_splits": spec.get("exclude_splits"),
+            }
+        )
 
     if not specs:
         results["issues"].append("No valid dataset paths found")
@@ -469,8 +475,7 @@ def test_cross_dataset_consistency(num_samples_per_dataset: int = 5) -> dict:
             if not np.allclose(padding_region, 0.0):
                 padding_violation_count += 1
                 if padding_violation_count <= 3:
-                    results["issues"].append(
-                        f"idx={idx} ({emb}): padding non-zero at dims {last_nonzero}:{D}")
+                    results["issues"].append(f"idx={idx} ({emb}): padding non-zero at dims {last_nonzero}:{D}")
 
         # Collect per-embodiment stats
         if emb not in per_embodiment_stats:
@@ -489,25 +494,27 @@ def test_cross_dataset_consistency(num_samples_per_dataset: int = 5) -> dict:
         stats["abs_means"].append(np.mean(np.abs(active)))
 
     # Summary
-    print(f"\n  {'='*70}")
+    print(f"\n  {'=' * 70}")
     print(f"  CROSS-DATASET CONSISTENCY RESULTS")
-    print(f"  {'='*70}")
+    print(f"  {'=' * 70}")
     print(f"  Wrong dimension:     {wrong_dim_count}")
     print(f"  NaN/Inf:             {nan_count}")
     print(f"  Padding violations:  {padding_violation_count}")
-    print(f"  {'='*70}")
+    print(f"  {'=' * 70}")
     print(f"  {'Embodiment':<24s} {'Samples':>8s} {'ActDim':>7s} {'Range':>24s} {'|Mean|':>10s}")
-    print(f"  {'-'*70}")
+    print(f"  {'-' * 70}")
 
     for emb in sorted(per_embodiment_stats.keys()):
         s = per_embodiment_stats[emb]
         rng_min = np.min(s["mins"]) if s["mins"] else 0
         rng_max = np.max(s["maxs"]) if s["maxs"] else 0
         abs_mean = np.mean(s["abs_means"]) if s["abs_means"] else 0
-        print(f"  {emb:<24s} {s['count']:>8d} {s['active_dim']:>7d} "
-              f"[{rng_min:>10.3f}, {rng_max:>10.3f}] {abs_mean:>10.4f}")
+        print(
+            f"  {emb:<24s} {s['count']:>8d} {s['active_dim']:>7d} "
+            f"[{rng_min:>10.3f}, {rng_max:>10.3f}] {abs_mean:>10.4f}"
+        )
 
-    print(f"  {'='*70}")
+    print(f"  {'=' * 70}")
 
     if wrong_dim_count > 0:
         results["issues"].append(f"{wrong_dim_count} samples had wrong action dimension")
@@ -517,8 +524,7 @@ def test_cross_dataset_consistency(num_samples_per_dataset: int = 5) -> dict:
         results["issues"].append(f"{padding_violation_count} samples had non-zero padding")
 
     results["per_embodiment"] = {
-        emb: {"active_dim": s["active_dim"], "count": s["count"]}
-        for emb, s in per_embodiment_stats.items()
+        emb: {"active_dim": s["active_dim"], "count": s["count"]} for emb, s in per_embodiment_stats.items()
     }
     return results
 
@@ -526,6 +532,7 @@ def test_cross_dataset_consistency(num_samples_per_dataset: int = 5) -> dict:
 # ============================================================================
 # Test 5: MixedLeRobotDataset loading
 # ============================================================================
+
 
 def test_mixture_dataset(num_samples: int = 5) -> dict:
     """Test the full MixedLeRobotDataset as used in training."""
@@ -542,12 +549,14 @@ def test_mixture_dataset(num_samples: int = 5) -> dict:
         dp = Path(spec["path"])
         if not dp.exists():
             continue
-        specs.append({
-            "path": spec["path"],
-            "embodiment": emb,
-            "mix_ratio": spec.get("mix_ratio", 1.0),
-            "exclude_splits": spec.get("exclude_splits"),
-        })
+        specs.append(
+            {
+                "path": spec["path"],
+                "embodiment": emb,
+                "mix_ratio": spec.get("mix_ratio", 1.0),
+                "exclude_splits": spec.get("exclude_splits"),
+            }
+        )
 
     if not specs:
         results["issues"].append("No valid dataset paths found")
@@ -567,8 +576,10 @@ def test_mixture_dataset(num_samples: int = 5) -> dict:
         results["n_samples"] = len(dataset)
         results["n_sub_datasets"] = len(dataset.sub_datasets)
         results["init_time"] = f"{init_time:.1f}s"
-        print(f"  Mixture loaded: {len(dataset):,} virtual samples, "
-              f"{len(dataset.sub_datasets)} sub-datasets in {init_time:.1f}s")
+        print(
+            f"  Mixture loaded: {len(dataset):,} virtual samples, "
+            f"{len(dataset.sub_datasets)} sub-datasets in {init_time:.1f}s"
+        )
     except Exception as e:
         results["issues"].append(f"MixedLeRobotDataset init failed: {e}")
         return results
@@ -590,13 +601,16 @@ def test_mixture_dataset(num_samples: int = 5) -> dict:
                 action_dim = action.shape[-1]
                 if action_dim != MAX_ACTION_DIM:
                     results["issues"].append(
-                        f"Sample {idx} ({emb}): action_dim={action_dim}, expected {MAX_ACTION_DIM}")
+                        f"Sample {idx} ({emb}): action_dim={action_dim}, expected {MAX_ACTION_DIM}"
+                    )
                 if i < 3:
                     # Check padding region is zeros
                     reg = EMBODIMENT_REGISTRY.get(emb, {})
                     raw_keys = reg.get("action_keys", [])
-                    print(f"    Sample {idx} ({emb}): action dim={action_dim}, "
-                          f"non-zero dims={np.count_nonzero(action.sum(axis=0))}")
+                    print(
+                        f"    Sample {idx} ({emb}): action dim={action_dim}, "
+                        f"non-zero dims={np.count_nonzero(action.sum(axis=0))}"
+                    )
 
         except Exception as e:
             results["issues"].append(f"Sample {idx} failed: {e}")
@@ -611,6 +625,7 @@ def test_mixture_dataset(num_samples: int = 5) -> dict:
 # ============================================================================
 # Test 6: DataLoader batch collation (reproduces torch.stack shape mismatch)
 # ============================================================================
+
 
 def test_dataloader_collation(batch_size: int = 16, num_batches: int = 10) -> dict:
     """Test that DataLoader can collate batches from MixedLeRobotDataset.
@@ -631,6 +646,7 @@ def test_dataloader_collation(batch_size: int = 16, num_batches: int = 10) -> di
     - No NaN/Inf in any tensor
     """
     from torch.utils.data import DataLoader
+
     from cosmos_predict2._src.predict2.action.datasets.gr00t_dreams.data.dataset import (
         MixedLeRobotDataset,
     )
@@ -643,12 +659,14 @@ def test_dataloader_collation(batch_size: int = 16, num_batches: int = 10) -> di
         dp = Path(spec["path"])
         if not dp.exists():
             continue
-        specs.append({
-            "path": spec["path"],
-            "embodiment": emb,
-            "mix_ratio": spec.get("mix_ratio", 1.0),
-            "exclude_splits": spec.get("exclude_splits"),
-        })
+        specs.append(
+            {
+                "path": spec["path"],
+                "embodiment": emb,
+                "mix_ratio": spec.get("mix_ratio", 1.0),
+                "exclude_splits": spec.get("exclude_splits"),
+            }
+        )
 
     if not specs:
         results["issues"].append("No valid dataset paths found")
@@ -754,6 +772,7 @@ def test_dataloader_collation(batch_size: int = 16, num_batches: int = 10) -> di
 # Main
 # ============================================================================
 
+
 def run_all(args):
     """Test all datasets in OPEN_H_DATASET_SPECS."""
     # Deduplicate by (path, embodiment)
@@ -775,9 +794,9 @@ def run_all(args):
     all_results = []
 
     # --- Test 1: File existence ---
-    print(f"\n{'='*80}")
+    print(f"\n{'=' * 80}")
     print("TEST 1: Required files check")
-    print(f"{'='*80}")
+    print(f"{'=' * 80}")
     missing_count = 0
     for dp, emb, excl in jobs:
         print(f"\n  [{emb}] {dp.name}")
@@ -796,15 +815,15 @@ def run_all(args):
             print(f"    [OK]   All files present ({eps} episodes, {vids} videos)")
 
     if args.dry_run:
-        print(f"\n{'='*80}")
+        print(f"\n{'=' * 80}")
         print(f"DRY RUN COMPLETE — {len(jobs) - missing_count}/{len(jobs)} datasets have all required files")
-        print(f"{'='*80}")
+        print(f"{'=' * 80}")
         return
 
     # --- Test 2: Per-dataset loading ---
-    print(f"\n{'='*80}")
+    print(f"\n{'=' * 80}")
     print(f"TEST 2: Single-dataset loading ({args.num_samples} samples each, split=train)")
-    print(f"{'='*80}")
+    print(f"{'=' * 80}")
     load_results = {}
     for dp, emb, excl in jobs:
         if not dp.exists():
@@ -820,9 +839,9 @@ def run_all(args):
             load_results[f"{emb}/{dp.name}"] = f"OK (dim={dim}, samples={n})"
 
     # --- Test 3: Action normalization + padding per dataset ---
-    print(f"\n{'='*80}")
+    print(f"\n{'=' * 80}")
     print(f"TEST 3: Action normalization + 44D padding ({args.num_samples} samples each)")
-    print(f"{'='*80}")
+    print(f"{'=' * 80}")
     norm_results = {}
     for dp, emb, excl in jobs:
         if not dp.exists():
@@ -840,9 +859,9 @@ def run_all(args):
 
     # --- Test 4: Cross-dataset consistency ---
     if args.test_mixture:
-        print(f"\n{'='*80}")
+        print(f"\n{'=' * 80}")
         print("TEST 4: Cross-dataset action consistency (44D, padding, distribution)")
-        print(f"{'='*80}")
+        print(f"{'=' * 80}")
         cross_res = test_cross_dataset_consistency(args.num_samples)
         if cross_res["issues"]:
             for issue in cross_res["issues"]:
@@ -850,29 +869,29 @@ def run_all(args):
 
     # --- Test 5: MixedLeRobotDataset basic loading ---
     if args.test_mixture:
-        print(f"\n{'='*80}")
+        print(f"\n{'=' * 80}")
         print("TEST 5: MixedLeRobotDataset (weighted mixture)")
-        print(f"{'='*80}")
+        print(f"{'=' * 80}")
         mix_res = test_mixture_dataset(args.num_samples)
         if mix_res["issues"]:
             print(f"  Issues: {mix_res['issues']}")
 
     # --- Test 6: DataLoader batch collation (reproduces torch.stack crash) ---
     if args.test_mixture:
-        print(f"\n{'='*80}")
+        print(f"\n{'=' * 80}")
         print("TEST 6: DataLoader batch collation (batch_size=16, 10 batches)")
         print(f"        This reproduces the torch.stack shape mismatch crash if")
         print(f"        state/action padding is broken.")
-        print(f"{'='*80}")
+        print(f"{'=' * 80}")
         collate_res = test_dataloader_collation(batch_size=16, num_batches=10)
         if collate_res["issues"]:
             for issue in collate_res["issues"]:
                 print(f"  [ISSUE] {issue}")
 
     # --- Summary ---
-    print(f"\n{'='*80}")
+    print(f"\n{'=' * 80}")
     print("SUMMARY — Data Loading (Test 2)")
-    print(f"{'='*80}")
+    print(f"{'=' * 80}")
     ok_count = sum(1 for v in load_results.values() if v.startswith("OK"))
     skip_count = sum(1 for v in load_results.values() if "SKIP" in v)
     fail_count = len(load_results) - ok_count - skip_count
@@ -882,9 +901,9 @@ def run_all(args):
         print(f"  [{marker:4s}] {name}: {status}")
 
     if norm_results:
-        print(f"\n{'='*80}")
+        print(f"\n{'=' * 80}")
         print("SUMMARY — Normalization + 44D Padding (Test 3)")
-        print(f"{'='*80}")
+        print(f"{'=' * 80}")
         n_ok = sum(1 for v in norm_results.values() if v.startswith("OK"))
         n_fail = len(norm_results) - n_ok
         print(f"  OK: {n_ok}  |  ISSUES: {n_fail}  |  Total: {len(norm_results)}")
@@ -892,7 +911,7 @@ def run_all(args):
             marker = "OK" if status.startswith("OK") else "FAIL"
             print(f"  [{marker:4s}] {name}: {status}")
 
-    print(f"{'='*80}")
+    print(f"{'=' * 80}")
 
 
 def run_single(args):
@@ -935,21 +954,22 @@ def main():
     )
 
     path_group = parser.add_mutually_exclusive_group(required=True)
-    path_group.add_argument("--all", action="store_true",
-                            help="Test all datasets in OPEN_H_DATASET_SPECS")
-    path_group.add_argument("--dataset-path", type=str,
-                            help="Test a single dataset")
+    path_group.add_argument("--all", action="store_true", help="Test all datasets in OPEN_H_DATASET_SPECS")
+    path_group.add_argument("--dataset-path", type=str, help="Test a single dataset")
 
-    parser.add_argument("--embodiment", type=str, default=None,
-                        choices=list(EMBODIMENT_REGISTRY.keys()) + [EmbodimentTag.CMR_VERSIUS.value],
-                        help="Embodiment (required for --dataset-path)")
+    parser.add_argument(
+        "--embodiment",
+        type=str,
+        default=None,
+        choices=list(EMBODIMENT_REGISTRY.keys()) + [EmbodimentTag.CMR_VERSIUS.value],
+        help="Embodiment (required for --dataset-path)",
+    )
     parser.add_argument("--exclude-splits", type=str, nargs="+", default=None)
-    parser.add_argument("--num-samples", type=int, default=3,
-                        help="Number of samples to load per dataset (default: 3)")
-    parser.add_argument("--test-mixture", action="store_true",
-                        help="Also test MixedLeRobotDataset (slower, requires all datasets)")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Only check file existence, don't load data")
+    parser.add_argument("--num-samples", type=int, default=3, help="Number of samples to load per dataset (default: 3)")
+    parser.add_argument(
+        "--test-mixture", action="store_true", help="Also test MixedLeRobotDataset (slower, requires all datasets)"
+    )
+    parser.add_argument("--dry-run", action="store_true", help="Only check file existence, don't load data")
     args = parser.parse_args()
 
     if not args.all and args.embodiment is None:

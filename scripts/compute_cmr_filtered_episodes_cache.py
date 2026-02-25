@@ -38,7 +38,6 @@ Example output:
 import argparse
 import hashlib
 import json
-import os
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -119,9 +118,7 @@ def _filter_episode_cmr_clutch(
     }
 
     chunk_idx = episode_idx // chunk_size
-    parquet_path = dataset_path / data_path_pattern.format(
-        episode_chunk=chunk_idx, episode_index=episode_idx
-    )
+    parquet_path = dataset_path / data_path_pattern.format(episode_chunk=chunk_idx, episode_index=episode_idx)
 
     if not parquet_path.exists():
         return episode_idx, [], stats
@@ -132,18 +129,10 @@ def _filter_episode_cmr_clutch(
     except Exception:
         return episode_idx, [], stats
 
-    engaged_left = np.array(
-        [s[CMR_RAW_INDEX_HAPTIC_ENGAGED_LEFT] for s in state_data], dtype=bool
-    )
-    engaged_right = np.array(
-        [s[CMR_RAW_INDEX_HAPTIC_ENGAGED_RIGHT] for s in state_data], dtype=bool
-    )
-    arm_linked_left = np.array(
-        [s[CMR_RAW_INDEX_ARM_LINKED_LEFT] for s in state_data], dtype=np.float32
-    )
-    arm_linked_right = np.array(
-        [s[CMR_RAW_INDEX_ARM_LINKED_RIGHT] for s in state_data], dtype=np.float32
-    )
+    engaged_left = np.array([s[CMR_RAW_INDEX_HAPTIC_ENGAGED_LEFT] for s in state_data], dtype=bool)
+    engaged_right = np.array([s[CMR_RAW_INDEX_HAPTIC_ENGAGED_RIGHT] for s in state_data], dtype=bool)
+    arm_linked_left = np.array([s[CMR_RAW_INDEX_ARM_LINKED_LEFT] for s in state_data], dtype=np.float32)
+    arm_linked_right = np.array([s[CMR_RAW_INDEX_ARM_LINKED_RIGHT] for s in state_data], dtype=np.float32)
 
     max_delta = max(action_delta_indices) if action_delta_indices else 0
     effective_length = max(0, episode_length - max_delta)
@@ -266,16 +255,26 @@ def filter_cmr_clutch_all_episodes(
     print(f"PER-RULE BREAKDOWN:")
     print(f"  Rule 1 (arm swap - left):     {aggregate_stats['rule1_arm_swap_left']:,} samples")
     print(f"  Rule 1 (arm swap - right):    {aggregate_stats['rule1_arm_swap_right']:,} samples")
-    print(f"  Rule 1 (arm swap - total):    {total_rule1:,} samples ({100 * total_rule1 / max(1, total_original):.2f}%)")
-    print(f"  Rule 2 (fully disengaged):    {aggregate_stats['rule2_fully_disengaged']:,} samples ({100 * aggregate_stats['rule2_fully_disengaged'] / max(1, total_original):.2f}%)")
+    print(
+        f"  Rule 1 (arm swap - total):    {total_rule1:,} samples ({100 * total_rule1 / max(1, total_original):.2f}%)"
+    )
+    print(
+        f"  Rule 2 (fully disengaged):    {aggregate_stats['rule2_fully_disengaged']:,} samples ({100 * aggregate_stats['rule2_fully_disengaged'] / max(1, total_original):.2f}%)"
+    )
     if aggregate_stats["out_of_bounds"] > 0:
         print(f"  Out of bounds (edge cases):   {aggregate_stats['out_of_bounds']:,} samples")
     print("-" * 80)
     print(f"EPISODE STATISTICS:")
     print(f"  Total episodes: {len(trajectory_ids)}")
-    print(f"  Episodes fully filtered (0 valid samples): {episodes_fully_filtered} ({100 * episodes_fully_filtered / max(1, len(trajectory_ids)):.1f}%)")
-    print(f"  Episodes partially filtered: {episodes_partially_filtered} ({100 * episodes_partially_filtered / max(1, len(trajectory_ids)):.1f}%)")
-    print(f"  Episodes unfiltered (all valid): {episodes_unfiltered} ({100 * episodes_unfiltered / max(1, len(trajectory_ids)):.1f}%)")
+    print(
+        f"  Episodes fully filtered (0 valid samples): {episodes_fully_filtered} ({100 * episodes_fully_filtered / max(1, len(trajectory_ids)):.1f}%)"
+    )
+    print(
+        f"  Episodes partially filtered: {episodes_partially_filtered} ({100 * episodes_partially_filtered / max(1, len(trajectory_ids)):.1f}%)"
+    )
+    print(
+        f"  Episodes unfiltered (all valid): {episodes_unfiltered} ({100 * episodes_unfiltered / max(1, len(trajectory_ids)):.1f}%)"
+    )
     print("=" * 80)
 
     return results, {
@@ -296,19 +295,19 @@ def get_cache_path(dataset_path: Path, split: str, action_delta_indices: list[in
 
 def compute_action_delta_indices(num_frames: int, timestep_interval: int = 6) -> list[int]:
     """Compute action delta indices matching groot_configs.py logic.
-    
+
     Args:
         num_frames: Number of VIDEO frames (e.g., 13 = 1 context + 12 prediction)
         timestep_interval: Frame stride (default 6 for 10fps from 60Hz)
-    
+
     Returns:
         List of delta indices for action sampling (num_frames - 1 entries)
-        
+
     Note:
         This matches groot_configs.py which uses:
             num_action_frames = num_frames - 1  # 12 action timesteps for 13 video frames
             action_delta_indices = list(range(0, num_action_frames * timestep_interval, timestep_interval))
-        
+
         The model expects num_actions to be divisible by temporal_compression_ratio (4).
         With num_frames=13: num_action_frames=12, and 12 % 4 = 0 ✓
     """
@@ -323,18 +322,18 @@ def load_dataset_metadata(dataset_path: Path) -> tuple[np.ndarray, np.ndarray, i
     episode_path = dataset_path / "meta/episodes.jsonl"
     with open(episode_path, "r") as f:
         episode_metadata = [json.loads(line) for line in f]
-    
+
     trajectory_ids = np.array([ep["episode_index"] for ep in episode_metadata])
     trajectory_lengths = np.array([ep["length"] for ep in episode_metadata])
-    
+
     # Load info.json
     info_path = dataset_path / "meta/info.json"
     with open(info_path, "r") as f:
         info_meta = json.load(f)
-    
+
     chunk_size = info_meta["chunks_size"]
     data_path_pattern = info_meta["data_path"]
-    
+
     return trajectory_ids, trajectory_lengths, chunk_size, data_path_pattern
 
 
@@ -347,7 +346,7 @@ def compute_filter_cache(
     num_workers: int | None = None,
 ) -> Path:
     """Compute and save the filter cache for a single dataset.
-    
+
     Args:
         dataset_path: Path to the dataset root
         split: Data split ("train" or "test")
@@ -355,19 +354,19 @@ def compute_filter_cache(
         timestep_interval: Frame stride
         force: If True, recompute even if cache exists
         num_workers: Number of parallel workers (default: min(cpu_count, 64))
-    
+
     Returns:
         Path to the saved cache file
     """
     dataset_path = Path(dataset_path)
-    
+
     # Compute action delta indices
     action_delta_indices = compute_action_delta_indices(num_frames, timestep_interval)
-    
+
     # Get cache path
     cache_path = get_cache_path(dataset_path, split, action_delta_indices)
-    
-    print(f"\n{'='*80}")
+
+    print(f"\n{'=' * 80}")
     print(f"Computing filter cache for: {dataset_path}")
     print(f"  Split: {split}")
     print(f"  Num video frames: {num_frames} (1 context + {num_frames - 1} prediction)")
@@ -375,19 +374,19 @@ def compute_filter_cache(
     print(f"  Timestep interval: {timestep_interval}")
     print(f"  Action delta indices: {action_delta_indices[:5]}... (len={len(action_delta_indices)})")
     print(f"  Cache path: {cache_path}")
-    print(f"{'='*80}")
-    
+    print(f"{'=' * 80}")
+
     # Check if cache already exists
     if cache_path.exists() and not force:
         print(f"[SKIP] Cache already exists: {cache_path}")
         print(f"       Use --force to recompute")
         return cache_path
-    
+
     start_time = time.time()
-    
+
     # Load dataset metadata
     trajectory_ids, trajectory_lengths, chunk_size, data_path_pattern = load_dataset_metadata(dataset_path)
-    
+
     # Run filtering
     filter_results, filter_stats = filter_cmr_clutch_all_episodes(
         dataset_path=dataset_path,
@@ -398,16 +397,16 @@ def compute_filter_cache(
         action_delta_indices=action_delta_indices,
         num_workers=num_workers,
     )
-    
+
     # Build all_steps list
     all_steps = []
     for trajectory_id in trajectory_ids:
         valid_indices = filter_results.get(int(trajectory_id), [])
         for base_index in valid_indices:
             all_steps.append((int(trajectory_id), base_index))
-    
+
     elapsed_time = time.time() - start_time
-    
+
     # Prepare cache data
     cache_stats = {
         "raw_frames": int(np.sum(trajectory_lengths)),
@@ -417,7 +416,7 @@ def compute_filter_cache(
         "compute_time_seconds": round(elapsed_time, 1),
         "filtering_stats": filter_stats["aggregate_stats"],
     }
-    
+
     cache_data = {
         "action_delta_indices": action_delta_indices,
         "all_steps": all_steps,
@@ -427,16 +426,16 @@ def compute_filter_cache(
         "num_frames": num_frames,
         "timestep_interval": timestep_interval,
     }
-    
+
     # Save cache
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     with open(cache_path, "w") as f:
         json.dump(cache_data, f)
-    
+
     print(f"\n[SUCCESS] Cached filter results to: {cache_path}")
     print(f"          Valid samples: {len(all_steps):,}")
     print(f"          Compute time: {elapsed_time:.1f} seconds")
-    
+
     return cache_path
 
 
@@ -482,21 +481,21 @@ def main():
         default=None,
         help=f"Number of parallel workers (default: min(cpu_count, {CMR_MAX_FILTER_WORKERS}))",
     )
-    
+
     args = parser.parse_args()
-    
+
     # Determine which datasets to process
     if args.dataset_path:
         dataset_paths = [Path(args.dataset_path)]
     else:
         dataset_paths = [Path(p) for p in DEFAULT_CMR_DATASET_PATHS]
-    
+
     # Determine which splits to process
     if args.split == "both":
         splits = ["train", "test"]
     else:
         splits = [args.split]
-    
+
     print("=" * 80)
     print("CMR VERSIUS FILTER CACHE COMPUTATION")
     print("=" * 80)
@@ -510,19 +509,19 @@ def main():
     print(f"Force recompute: {args.force}")
     print(f"Num workers: {args.num_workers or f'auto (max {CMR_MAX_FILTER_WORKERS})'}")
     print("=" * 80)
-    
+
     # Process each dataset and split
     success_count = 0
     skip_count = 0
     error_count = 0
     cache_paths = []
-    
+
     for dataset_path in dataset_paths:
         if not dataset_path.exists():
             print(f"\n[ERROR] Dataset path does not exist: {dataset_path}")
             error_count += 1
             continue
-        
+
         for split in splits:
             try:
                 cache_path = compute_filter_cache(
@@ -541,7 +540,7 @@ def main():
             except Exception as e:
                 print(f"\n[ERROR] Failed to compute cache for {dataset_path} ({split}): {e}")
                 error_count += 1
-    
+
     # Summary
     print("\n" + "=" * 80)
     print("SUMMARY")
@@ -554,11 +553,10 @@ def main():
         status = "✓" if p.exists() else "✗"
         print(f"  {status} {p}")
     print("=" * 80)
-    
+
     if error_count > 0:
         sys.exit(1)
 
 
 if __name__ == "__main__":
     main()
-

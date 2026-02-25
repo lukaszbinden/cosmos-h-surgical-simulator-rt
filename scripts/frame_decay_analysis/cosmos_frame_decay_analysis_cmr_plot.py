@@ -30,16 +30,14 @@ import argparse
 import json
 import os
 from datetime import datetime
-from typing import Dict, List, Optional, Any
+from typing import Any, Dict, List, Optional
 
 import matplotlib.pyplot as plt
 from matplotlib import colors as mcolors
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Plot CMR Versius frame decay metrics with dual y-axes."
-    )
+    parser = argparse.ArgumentParser(description="Plot CMR Versius frame decay metrics with dual y-axes.")
     parser.add_argument(
         "--results_path",
         type=str,
@@ -81,28 +79,28 @@ def parse_args() -> argparse.Namespace:
 def load_results(results_path: str) -> tuple[List[Dict], Dict[str, Any]]:
     """
     Load results from JSON file.
-    
-    Handles both the new CMR format (with 'metadata' and 'results' keys) and 
+
+    Handles both the new CMR format (with 'metadata' and 'results' keys) and
     the legacy chole format (flat list of checkpoint entries).
-    
+
     Returns:
         Tuple of (results_list, metadata_dict)
     """
     with open(results_path, "r") as f:
         data = json.load(f)
-    
+
     # Check if this is the new CMR format with metadata
-    if isinstance(data, dict) and 'results' in data:
-        metadata = data.get('metadata', {})
-        results = data['results']
+    if isinstance(data, dict) and "results" in data:
+        metadata = data.get("metadata", {})
+        results = data["results"]
         if not isinstance(results, list):
             raise ValueError("Expected 'results' key to contain a list of checkpoint entries.")
         return results, metadata
-    
+
     # Legacy format: flat list of checkpoint entries
     if isinstance(data, list):
         return data, {}
-    
+
     raise ValueError("Unexpected JSON format. Expected either a dict with 'results' key or a list.")
 
 
@@ -118,15 +116,13 @@ def select_checkpoint(data: List[Dict], checkpoint_label: Optional[str]) -> Dict
             return entry
 
     available = ", ".join(entry.get("checkpoint_label", "<unknown>") for entry in data)
-    raise ValueError(
-        f"Checkpoint label '{checkpoint_label}' not found. Available labels: {available}"
-    )
+    raise ValueError(f"Checkpoint label '{checkpoint_label}' not found. Available labels: {available}")
 
 
 def extract_metric_series(checkpoint_data: Dict, metric_name: str) -> Dict[str, List[float]]:
     """
     Extract metric means and stds from checkpoint data.
-    
+
     Handles both:
     - New CMR format: {'l1_per_frame': {'means': [...], 'stds': [...]}}
     - Legacy chole format: {'aggregated_l1_per_frame': [{'mean': x, 'std': y}, ...]}
@@ -134,12 +130,12 @@ def extract_metric_series(checkpoint_data: Dict, metric_name: str) -> Dict[str, 
     # Try new CMR format first
     if metric_name in checkpoint_data:
         metric_data = checkpoint_data[metric_name]
-        if isinstance(metric_data, dict) and 'means' in metric_data:
+        if isinstance(metric_data, dict) and "means" in metric_data:
             return {
                 "means": [float(m) for m in metric_data.get("means", [])],
-                "stds": [float(s) for s in metric_data.get("stds", [])]
+                "stds": [float(s) for s in metric_data.get("stds", [])],
             }
-    
+
     # Try legacy format (aggregated_l1_per_frame or aggregated_ssim_per_frame)
     legacy_key = f"aggregated_{metric_name}"
     if legacy_key in checkpoint_data:
@@ -151,7 +147,7 @@ def extract_metric_series(checkpoint_data: Dict, metric_name: str) -> Dict[str, 
                 means.append(float(entry.get("mean", 0.0)))
                 stds.append(float(entry.get("std", 0.0)))
             return {"means": means, "stds": stds}
-    
+
     # Return empty if metric not found
     return {"means": [], "stds": []}
 
@@ -187,12 +183,12 @@ def plot_dual_axis(
     fig, ax_l1 = plt.subplots(figsize=figsize)
 
     # Color-blind friendly colors
-    color_l1 = "#E69F00"   # Orange
+    color_l1 = "#E69F00"  # Orange
     color_ssim = "#0072B2"  # Blue
 
     # Plot L1 on the left y-axis
     if use_error_band:
-        line_l1, = ax_l1.plot(frames, l1_means, color=color_l1, linewidth=1.5, label="L1 distance")
+        (line_l1,) = ax_l1.plot(frames, l1_means, color=color_l1, linewidth=1.5, label="L1 distance")
         lower = [m - s for m, s in zip(l1_means, l1_stds)]
         upper = [m + s for m, s in zip(l1_means, l1_stds)]
         ax_l1.fill_between(
@@ -218,11 +214,13 @@ def plot_dual_axis(
             elinewidth=1,
             capsize=3,
         )
-        line_l1, = ax_l1.plot(frames, l1_means, color=color_l1, linewidth=1.5, label="L1 distance")
-    
+        (line_l1,) = ax_l1.plot(frames, l1_means, color=color_l1, linewidth=1.5, label="L1 distance")
+
     ax_l1.set_xlabel("Generated Frame", fontsize=12)
     ax_l1.set_ylabel("L1 Distance", color=color_l1, fontsize=11)
-    ax_l1.tick_params(axis="y", colors=color_l1, left=True, right=False, labelcolor=color_l1, labelleft=True, labelsize=9)
+    ax_l1.tick_params(
+        axis="y", colors=color_l1, left=True, right=False, labelcolor=color_l1, labelleft=True, labelsize=9
+    )
     if "left" in ax_l1.spines:
         ax_l1.spines["left"].set_visible(True)
         ax_l1.spines["left"].set_color(color_l1)
@@ -230,7 +228,7 @@ def plot_dual_axis(
     # Plot SSIM on the right y-axis
     ax_ssim = ax_l1.twinx()
     if use_error_band:
-        line_ssim, = ax_ssim.plot(frames, ssim_means, color=color_ssim, linewidth=1.5, label="SSIM")
+        (line_ssim,) = ax_ssim.plot(frames, ssim_means, color=color_ssim, linewidth=1.5, label="SSIM")
         lower_ssim = [m - s for m, s in zip(ssim_means, ssim_stds)]
         upper_ssim = [m + s for m, s in zip(ssim_means, ssim_stds)]
         ax_ssim.fill_between(
@@ -256,10 +254,19 @@ def plot_dual_axis(
             elinewidth=1,
             capsize=3,
         )
-        line_ssim, = ax_ssim.plot(frames, ssim_means, color=color_ssim, linewidth=1.5, label="SSIM")
+        (line_ssim,) = ax_ssim.plot(frames, ssim_means, color=color_ssim, linewidth=1.5, label="SSIM")
 
     ax_ssim.set_ylabel("SSIM", color=color_ssim, fontsize=11)
-    ax_ssim.tick_params(axis="y", colors=color_ssim, left=False, right=True, labelcolor=color_ssim, labelleft=False, labelright=True, labelsize=9)
+    ax_ssim.tick_params(
+        axis="y",
+        colors=color_ssim,
+        left=False,
+        right=True,
+        labelcolor=color_ssim,
+        labelleft=False,
+        labelright=True,
+        labelsize=9,
+    )
     if "right" in ax_ssim.spines:
         ax_ssim.spines["right"].set_visible(True)
         ax_ssim.spines["right"].set_color(color_ssim)
@@ -271,11 +278,11 @@ def plot_dual_axis(
 
     # Add title if specified
     if title:
-        fig.suptitle(title, fontsize=14, fontweight='bold')
+        fig.suptitle(title, fontsize=14, fontweight="bold")
     elif metadata:
         # Auto-generate title from metadata
-        total_frames = metadata.get('total_frames_analyzed', len(frames))
-        seeds = metadata.get('seeds', [])
+        total_frames = metadata.get("total_frames_analyzed", len(frames))
+        seeds = metadata.get("seeds", [])
         if seeds:
             auto_title = f"CMR Frame Decay Analysis: {checkpoint_label} ({total_frames} frames, {len(seeds)} seeds)"
         else:
@@ -293,61 +300,61 @@ def print_summary(checkpoint_data: Dict, metadata: Dict):
     print("\n" + "=" * 60)
     print("FRAME DECAY SUMMARY")
     print("=" * 60)
-    
-    label = checkpoint_data.get('checkpoint_label', 'Unknown')
+
+    label = checkpoint_data.get("checkpoint_label", "Unknown")
     print(f"Checkpoint: {label}")
     print(f"Episodes: {checkpoint_data.get('num_episodes', 'N/A')}")
     print(f"Max frames: {checkpoint_data.get('max_frames', 'N/A')}")
-    
+
     if metadata:
         print(f"Seeds: {metadata.get('seeds', 'N/A')}")
         print(f"Total frames analyzed: {metadata.get('total_frames_analyzed', 'N/A')}")
-    
+
     # L1 summary
-    l1_data = extract_metric_series(checkpoint_data, 'l1_per_frame')
-    if l1_data['means']:
+    l1_data = extract_metric_series(checkpoint_data, "l1_per_frame")
+    if l1_data["means"]:
         print(f"\nL1 Distance:")
         print(f"  First frame: {l1_data['means'][0]:.6f}")
         print(f"  Last frame:  {l1_data['means'][-1]:.6f}")
-        increase = l1_data['means'][-1] - l1_data['means'][0]
-        pct_increase = (l1_data['means'][-1] / l1_data['means'][0] - 1) * 100 if l1_data['means'][0] > 0 else 0
+        increase = l1_data["means"][-1] - l1_data["means"][0]
+        pct_increase = (l1_data["means"][-1] / l1_data["means"][0] - 1) * 100 if l1_data["means"][0] > 0 else 0
         print(f"  Increase:    {increase:.6f} ({pct_increase:.1f}%)")
-    
+
     # SSIM summary
-    ssim_data = extract_metric_series(checkpoint_data, 'ssim_per_frame')
-    if ssim_data['means']:
+    ssim_data = extract_metric_series(checkpoint_data, "ssim_per_frame")
+    if ssim_data["means"]:
         print(f"\nSSIM:")
         print(f"  First frame: {ssim_data['means'][0]:.6f}")
         print(f"  Last frame:  {ssim_data['means'][-1]:.6f}")
-        decrease = ssim_data['means'][0] - ssim_data['means'][-1]
-        pct_decrease = (1 - ssim_data['means'][-1] / ssim_data['means'][0]) * 100 if ssim_data['means'][0] > 0 else 0
+        decrease = ssim_data["means"][0] - ssim_data["means"][-1]
+        pct_decrease = (1 - ssim_data["means"][-1] / ssim_data["means"][0]) * 100 if ssim_data["means"][0] > 0 else 0
         print(f"  Decrease:    {decrease:.6f} ({pct_decrease:.1f}%)")
-    
+
     print("=" * 60)
 
 
 def main() -> None:
     args = parse_args()
-    
+
     # Parse figsize
     try:
-        width, height = map(float, args.figsize.split(','))
+        width, height = map(float, args.figsize.split(","))
         figsize = (width, height)
     except ValueError:
         print(f"Warning: Invalid figsize '{args.figsize}', using default (12, 3)")
         figsize = (12, 3)
-    
+
     # Load results
     data, metadata = load_results(args.results_path)
     checkpoint_data = select_checkpoint(data, args.checkpoint_label)
 
     # Extract metrics
-    l1_series = extract_metric_series(checkpoint_data, 'l1_per_frame')
-    ssim_series = extract_metric_series(checkpoint_data, 'ssim_per_frame')
+    l1_series = extract_metric_series(checkpoint_data, "l1_per_frame")
+    ssim_series = extract_metric_series(checkpoint_data, "ssim_per_frame")
 
     # Determine frame numbers
     frames = list(range(1, len(l1_series["means"]) + 1))
-    
+
     # Ensure L1 and SSIM have the same number of frames
     if len(ssim_series["means"]) != len(frames):
         min_len = min(len(frames), len(ssim_series["means"]))
