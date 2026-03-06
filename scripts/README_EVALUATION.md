@@ -3,27 +3,52 @@
 This document describes the quantitative evaluation pipeline implemented in
 [`cosmos_h_surgical_simulator_quant_eval.py`](./cosmos_h_surgical_simulator_quant_eval.py).
 The script benchmarks action-conditioned video generation checkpoints of the
-Cosmos Predict-2.5 world model on CMR Surgical Versius robotic surgery data.
+Cosmos Predict-2.5 world model across the full Open-H multi-embodiment
+surgical robotics benchmark, as well as in a legacy CMR-only mode.
 
 ## Overview
 
 For each checkpoint under evaluation the script:
 
-1. **Generates videos** autoregressively (6 chunks of 12 frames = 72 generated
-   frames per episode) conditioned on ground-truth actions and an initial frame.
+1. **Generates videos** autoregressively conditioned on ground-truth actions
+   and an initial frame.  The number of autoregressive chunks depends on
+   episode length (up to 6 chunks of 12 frames = 72 generated frames for CMR;
+   shorter for non-CMR datasets with smaller episodes).
 2. **Computes three complementary metrics** that capture different quality
    dimensions of the generated video relative to the ground-truth.
-3. **Reports aggregated results** across datasets, episodes, and seeds in a
-   structured log and a JSON file suitable for downstream analysis and plotting.
+3. **Reports aggregated results** across datasets, embodiments, episodes, and
+   seeds in a structured log and a JSON file suitable for downstream analysis
+   and plotting.
+
+### Two Operating Modes
+
+The script supports two modes:
+
+**Multi-dataset mode** (`--test_episodes_json`):
+Evaluates across ALL Open-H test datasets specified in a JSON file produced by
+[`print_test_datasets_and_episodes.py`](./print_test_datasets_and_episodes.py).
+Each dataset is loaded with its embodiment-specific transforms via
+`WrappedLeRobotSingleDataset`, supporting heterogeneous action spaces,
+timestep intervals, and normalization.  Action vectors are zero-padded to the
+unified 44D dimension (see
+[`README_ACTION_SPACE.md`](./README_ACTION_SPACE.md)).  Non-CMR datasets may
+have shorter episodes; the minimum-chunk requirement is relaxed to 1 (vs. 6
+for CMR).
+
+**Legacy CMR-only mode** (no `--test_episodes_json`):
+Evaluates the 4 hardcoded CMR Versius procedures (prostatectomy, inguinal
+hernia, hysterectomy, cholecystectomy) using `LeRobotDataset` with 5 episodes
+per dataset and 6 autoregressive chunks per episode.
 
 ### Evaluation Matrix (defaults)
 
-| Parameter | Default |
-|---|---|
-| Datasets | 4 (prostatectomy, inguinal hernia, hysterectomy, cholecystectomy) |
-| Episodes per dataset | 5 |
-| Seeds per episode | 3 |
-| **Total evaluations per checkpoint** | **Up to 60** (default configuration) |
+| Parameter | Multi-dataset mode | Legacy CMR-only mode |
+|---|---|---|
+| Datasets | All Open-H test datasets (~26) | 4 CMR procedures |
+| Episodes per dataset | 3 (configurable via `--episodes_per_dataset`) | 5 (configurable via `--num_episodes`) |
+| Seeds per episode | 2 (configurable via `--num_seeds`) | 3 |
+| Min autoregressive chunks | 1 (adapts to episode length) | 6 (72 frames required) |
+| **Typical total evaluations** | **~100–150** per checkpoint | **Up to 60** per checkpoint |
 
 ### Two-Phase Execution
 
@@ -35,6 +60,58 @@ sequential phases:
   Decay Score (FDS).  Store video arrays in CPU memory.
 - **Phase 2** — Unload Cosmos, load Medical-SAM3, compute GATC and TCD on the
   stored video pairs.
+
+---
+
+## Multi-Dataset Mode
+
+When `--test_episodes_json` is provided, the script evaluates across all
+embodiments in the Open-H benchmark.  This is the recommended mode for
+comprehensive checkpoint evaluation.
+
+### Workflow
+
+1. **Generate test episode index** — Run
+   [`print_test_datasets_and_episodes.py`](./print_test_datasets_and_episodes.py)
+   to produce a JSON file listing all test-split episodes per dataset:
+
+```bash
+python scripts/print_test_datasets_and_episodes.py --output output/open-h_test_episodes.json
+```
+
+2. **Run evaluation** — Pass the JSON to the evaluation script:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python scripts/cosmos_h_surgical_simulator_quant_eval.py \
+  --ckpt_path /path/to/model_ema_bf16.pt \
+  --sam3_checkpoint /path/to/medical_sam3_cholecseg8k.pt \
+  --test_episodes_json output/open-h_test_episodes.json \
+  --episodes_per_dataset 2 --num_seeds 2
+```
+
+### Per-embodiment handling
+
+Each dataset is loaded with its own embodiment-specific transforms
+(`construct_modality_config_and_transforms`), matching the training pipeline
+exactly.  Key per-embodiment differences handled automatically:
+
+| Aspect | How it adapts |
+|---|---|
+| Timestep interval | Resolved from `EMBODIMENT_REGISTRY` (e.g. 6 for CMR, 5 for dVRK JHU, 3 for Stanford) |
+| Action transform | `GenericRelativeActionTransform` or `CMRVersiusRelativeActionTransform` |
+| Action padding | Zero-padded to 44D to match model input dimension |
+| Episode filtering | `exclude_splits` looked up from `OPEN_H_DATASET_SPECS` |
+| Min chunk requirement | Relaxed to 1 chunk (non-CMR datasets often have shorter episodes) |
+
+### Dataset exclusion
+
+Large datasets that would dominate evaluation time can be excluded:
+
+```bash
+--exclude_datasets srth_porcine_chole_fix suturebot_2 suturebot_3
+```
+
+Dataset names must match the top-level keys in the `test_episodes.json` file.
 
 ---
 
@@ -78,6 +155,9 @@ reported for three temporal phases:
 | Early | 1 – 12 | Chunk 1 |
 | Mid | 13 – 36 | Chunks 2–3 |
 | Late | 37 – 72 | Chunks 4–6 |
+
+Note: non-CMR datasets with shorter episodes may only populate the Early (and
+sometimes Mid) chunk phases; Late chunk values will be reported as N/A.
 
 ---
 
@@ -231,12 +311,25 @@ Medical-SAM3 must be installed and configured separately:
 
 ## Usage
 
-### Single checkpoint
+### Multi-dataset evaluation (recommended)
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python scripts/cosmos_h_surgical_simulator_quant_eval.py \
   --ckpt_path /path/to/model_ema_bf16.pt \
-  --sam3_checkpoint /path/to/medical_sam3_cholecseg8k.pt
+  --sam3_checkpoint /path/to/medical_sam3_cholecseg8k.pt \
+  --test_episodes_json output/open-h_test_episodes.json \
+  --episodes_per_dataset 2 --num_seeds 2
+```
+
+### Multi-dataset with dataset exclusions
+
+```bash
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python scripts/cosmos_h_surgical_simulator_quant_eval.py \
+  --ckpt_path /path/to/model_ema_bf16.pt \
+  --sam3_checkpoint /path/to/medical_sam3_cholecseg8k.pt \
+  --test_episodes_json output/open-h_test_episodes.json \
+  --episodes_per_dataset 2 --num_seeds 2 \
+  --exclude_datasets srth_porcine_chole_fix suturebot_2 suturebot_3
 ```
 
 ### Multiple checkpoints (compared in final report)
@@ -245,6 +338,15 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python scripts/cosmos_h_surgical_simulator_q
 CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python scripts/cosmos_h_surgical_simulator_quant_eval.py \
   --ckpt_path /path/to/ckpt_10k.pt /path/to/ckpt_20k.pt \
   --ckpt_labels "10k-steps" "20k-steps" \
+  --sam3_checkpoint /path/to/medical_sam3_cholecseg8k.pt \
+  --test_episodes_json output/open-h_test_episodes.json
+```
+
+### Legacy CMR-only (single checkpoint)
+
+```bash
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python scripts/cosmos_h_surgical_simulator_quant_eval.py \
+  --ckpt_path /path/to/model_ema_bf16.pt \
   --sam3_checkpoint /path/to/medical_sam3_cholecseg8k.pt
 ```
 
@@ -264,13 +366,17 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python scripts/cosmos_h_surgical_simulator_q
 | `--ckpt_path` | *(required)* | One or more Cosmos checkpoint `.pt` files |
 | `--sam3_checkpoint` | *(required)* | Medical-SAM3 checkpoint (fine-tuned on CholecSeg8k) |
 | `--experiment` | `cosmos_predict2p5_2B_...` | Experiment config name |
-| `--num_episodes` | 5 | Episodes per dataset (1–5) |
+| `--test_episodes_json` | *(none)* | Path to test_episodes.json for multi-dataset mode (from `print_test_datasets_and_episodes.py`) |
+| `--episodes_per_dataset` | 3 | Max episodes per dataset in multi-dataset mode |
+| `--exclude_datasets` | *(none)* | Dataset names to skip in multi-dataset mode |
+| `--num_episodes` | 5 | Episodes per dataset in legacy CMR-only mode (max 5) |
 | `--num_seeds` | 3 | Seeds per evaluation |
 | `--seed` | 0 | Base seed |
+| `--data_split` | `test` | Data split to use (`train`, `test`, `full`) |
 | `--gatc_k` | 3 | GATC translation search radius in pixels |
 | `--gatc_use_grad` | off | Use gradient magnitude instead of grayscale for GATC |
 | `--save_videos` | off | Save generated and comparison videos as MP4 |
-| `--save_path` | `output/quant_eval_cmr` | Output directory |
+| `--save_path` | `output/quant_eval` | Output directory (a timestamped sub-directory is created per run) |
 
 ---
 
@@ -282,16 +388,19 @@ At the end of evaluation, a structured report is printed to the log containing:
 
 - Per-checkpoint summary: FDS (mean L1 +/- std), GATC (median +/- std),
   TCD (median +/- std), per-chunk breakdowns.
-- Per-dataset breakdown table.
+- Per-dataset breakdown table with embodiment tag, L1, SSIM, GATC, and TCD
+  for each dataset.
 - Cross-checkpoint comparison table and rankings (when multiple checkpoints
   are evaluated).
+- Per-chunk comparison table (Early/Mid/Late) across checkpoints.
 - CSV-formatted blocks for direct copy-paste into spreadsheets.
 
 ### JSON file
 
 A timestamped JSON file is saved to `--save_path` containing per-episode
 **aggregated** scores and checkpoint-level aggregated statistics for
-programmatic analysis.
+programmatic analysis.  In multi-dataset mode, the JSON metadata includes
+embodiment tags and timestep intervals for each dataset.
 
 ### Plotting
 
@@ -299,10 +408,22 @@ Use [`plot_quant_eval_results.py`](./plot_quant_eval_results.py)
 to generate comparison plots from the JSON output or from hardcoded results:
 
 ```bash
-python scripts/plot_quant_eval_results.py --json output/quant_eval_cmr/quant_eval_results_*.json
+python scripts/plot_quant_eval_results.py --json output/quant_eval/*/quant_eval_results.json
 ```
 
 This produces:
 - Metric-over-iteration line plots (FDS, GATC, TCD).
 - Bar chart comparisons.
 - Per-chunk (Early/Mid/Late) 3-panel plots for each metric.
+
+---
+
+## Source Code Pointers
+
+| Component | File |
+|---|---|
+| Evaluation script | [`cosmos_h_surgical_simulator_quant_eval.py`](./cosmos_h_surgical_simulator_quant_eval.py) |
+| Test episode generation | [`print_test_datasets_and_episodes.py`](./print_test_datasets_and_episodes.py) |
+| Result plotting | [`plot_quant_eval_results.py`](./plot_quant_eval_results.py) |
+| Embodiment registry & dataset specs | [`groot_configs.py`](../cosmos_predict2/_src/predict2/action/datasets/gr00t_dreams/groot_configs.py) |
+| Action space design | [`README_ACTION_SPACE.md`](./README_ACTION_SPACE.md) |
