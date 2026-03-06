@@ -1,4 +1,4 @@
-# Quantitative Evaluation for Cosmos-H-Surgical-Simulator
+# Cosmos-H-Surgical-Simulator: Quantitative Evaluation
 
 This document describes the quantitative evaluation pipeline implemented in
 [`cosmos_h_surgical_simulator_quant_eval.py`](./cosmos_h_surgical_simulator_quant_eval.py).
