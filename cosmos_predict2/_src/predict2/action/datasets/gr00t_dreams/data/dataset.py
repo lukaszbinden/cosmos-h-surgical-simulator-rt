@@ -1171,12 +1171,51 @@ class LeRobotSingleDataset(Dataset):
         # Get the sub-key
         key = key.replace("video.", "")
         video_path = self.get_video_path(trajectory_id, key)
-        # Get the action/state timestamps for each frame in the video
+
+        # #############################################################################
+        # BUGFIX FOR OPEN-H DATASETS WITH BROKEN TIMESTAMPs, 3/9/2026
+        # #############################################################################
+        # Build per-frame timestamps for video frame lookup.
+        #
+        # Some datasets (e.g. JHU dVRK suturebot, jesse_pickup_only) store Unix
+        # epoch timestamps as float32 in the parquet.  At magnitude ~1.7e9,
+        # float32 only has ~128s resolution, so the 0.033s per-frame spacing is
+        # completely lost — all rows report the same timestamp and every frame
+        # request maps to frame 0, producing a static video.
+        #
+        # Other datasets (e.g. LSCR Cholecystectomy) have near-zero timestamps
+        # with negligible range, or wildly wrong spacing.
+        #
+        # Detection: if the timestamp range across the episode is less than the
+        # expected span of one chunk (num_frames / fps seconds), the timestamps
+        # are unreliable and we fall back to index-derived timestamps using the
+        # dataset's FPS from info.json.
         assert self.curr_traj_data is not None, f"No data found for {trajectory_id=}"
         assert "timestamp" in self.curr_traj_data.columns, f"No timestamp found in {trajectory_id=}"
         timestamp: np.ndarray = self.curr_traj_data["timestamp"].to_numpy()
-        # Get the corresponding video timestamps from the step indices
-        video_timestamp = timestamp[step_indices]
+
+        video_key_for_fps = key.replace("video.", "")
+        fps = self.metadata.modalities.video[video_key_for_fps].fps
+        expected_frame_interval = 1.0 / fps
+        expected_min_range = len(step_indices) * expected_frame_interval
+
+        ts_range = float(timestamp[-1]) - float(timestamp[0])
+        num_unique = len(np.unique(timestamp))
+        mean_spacing = ts_range / max(len(timestamp) - 1, 1)
+        ts_looks_broken = (
+            ts_range < expected_min_range  # range too small for the requested frames
+            or float(timestamp[0]) > 1e6  # absolute epoch values
+            or num_unique < len(timestamp) * 0.5  # more than half the rows share a value
+            or mean_spacing > expected_frame_interval * 10  # spacing wildly wrong (>10x expected)
+        )
+
+        if ts_looks_broken:
+            video_timestamp = step_indices.astype(np.float32) / float(fps)
+        else:
+            video_timestamp = timestamp[step_indices]
+        # #############################################################################
+        # BUGFIX FOR OPEN-H DATASETS WITH BROKEN TIMESTAMPs, 3/9/2026
+        # #############################################################################
 
         try:
             return get_frames_by_timestamps(
