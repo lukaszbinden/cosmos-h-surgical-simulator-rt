@@ -53,9 +53,9 @@ class Mlp(nn.Module):
             b = linear.bias
             local_w = w.to_local() if hasattr(w, "to_local") else w.data
             local_b = b.to_local() if hasattr(b, "to_local") else b.data
-            init.kaiming_uniform_(local_w, a=5 ** 0.5)
+            init.kaiming_uniform_(local_w, a=5**0.5)
             fan_in, _ = init._calculate_fan_in_and_fan_out(local_w)
-            bound = 1 / fan_in ** 0.5 if fan_in > 0 else 0
+            bound = 1 / fan_in**0.5 if fan_in > 0 else 0
             init.uniform_(local_b, -bound, bound)
 
     def forward(self, x):
@@ -113,8 +113,10 @@ class ActionConditionedMinimalV1LVGDiT(MiniTrainDIT):
         Kaiming uniform initialization directly on the local tensor data,
         bypassing DTensor dispatch.
         """
-        for name, mlp in [("action_embedder_B_D", self.action_embedder_B_D),
-                          ("action_embedder_B_3D", self.action_embedder_B_3D)]:
+        for name, mlp in [
+            ("action_embedder_B_D", self.action_embedder_B_D),
+            ("action_embedder_B_3D", self.action_embedder_B_3D),
+        ]:
             mlp.init_weights()
             fc1_w = mlp.fc1.weight
             fc2_w = mlp.fc2.weight
@@ -288,8 +290,10 @@ class ActionChunkConditionedMinimalV1LVGDiT(MiniTrainDIT):
         Kaiming uniform initialization directly on the local tensor data,
         bypassing DTensor dispatch.
         """
-        for name, mlp in [("action_embedder_B_D", self.action_embedder_B_D),
-                          ("action_embedder_B_3D", self.action_embedder_B_3D)]:
+        for name, mlp in [
+            ("action_embedder_B_D", self.action_embedder_B_D),
+            ("action_embedder_B_3D", self.action_embedder_B_3D),
+        ]:
             mlp.init_weights()
             fc1_w = mlp.fc1.weight
             fc2_w = mlp.fc2.weight

@@ -292,13 +292,12 @@ class ImaginaireTrainer:
         action_weight_params = [
             (name, p)
             for name, p in net.named_parameters()
-            if "action_embedder" in name and name.endswith(".weight")
+            if "action_embedder" in name
+            and name.endswith(".weight")
             and (p.data.to_local() if hasattr(p.data, "to_local") else p.data).device.type != "meta"
         ]
         if not action_weight_params:
-            log.info(
-                "[ACTION-EMB-FIX] Skipped: no materialized action_embedder weight matrices found on model.net."
-            )
+            log.info("[ACTION-EMB-FIX] Skipped: no materialized action_embedder weight matrices found on model.net.")
             return
 
         all_zero = all(
@@ -307,9 +306,7 @@ class ImaginaireTrainer:
         )
 
         if not all_zero:
-            log.info(
-                "[ACTION-EMB-FIX] Skipped: checkpoint already contains nonzero action embedder weights."
-            )
+            log.info("[ACTION-EMB-FIX] Skipped: checkpoint already contains nonzero action embedder weights.")
             return
 
         if iteration == 0:
@@ -341,7 +338,9 @@ class ImaginaireTrainer:
             broadcast_dtensor_model_states(model.net, fsdp_device_mesh)
             if hasattr(model, "net_ema") and model.net_ema is not None:
                 broadcast_dtensor_model_states(model.net_ema, fsdp_device_mesh)
-            log.info("[ACTION-EMB-FIX] Synchronized reinitialized weights (net + net_ema) across ranks via DTensor broadcast.")
+            log.info(
+                "[ACTION-EMB-FIX] Synchronized reinitialized weights (net + net_ema) across ranks via DTensor broadcast."
+            )
         else:
             if distributed.is_rank0():
                 net.reinitialize_action_embedders()
