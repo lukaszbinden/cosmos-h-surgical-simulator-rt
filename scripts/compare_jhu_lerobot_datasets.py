@@ -119,6 +119,119 @@ MODALITY_VIDEO_STRUCTURAL_KEYS: tuple[str, ...] = ("original_key",)
 
 
 # ---------------------------------------------------------------------------
+# Compatibility policy
+# ---------------------------------------------------------------------------
+# The two datasets we compare in practice come from two different converter
+# lineages with different conventions:
+#
+#   - ``open-h-embodiment/scripts/conversion/dvrk_zarr_to_lerobot.py`` (the
+#     script that produced the reference ``hf_suturebot``) uses:
+#       * ``robot_type = "dvrk"``
+#       * dotted camera names: ``observation.images.endoscope.left`` etc.
+#       * a nested ``names`` list due to a ``"names": [states_name]`` bug:
+#         it emits ``[[n1, n2, ...]]`` instead of the LeRobot-schema
+#         ``[n1, n2, ...]``.
+#       * no explicit ``dtype``/``absolute``/``rotation_type`` in
+#         modality.json state/action entries (LeRobot applies defaults).
+#
+#   - ``cosmos-h-surgical-simulator-rt/scripts/convert_jhu_zarr_to_lerobot.py``
+#     (this script's companion — the one we use to produce new subsets) uses:
+#       * ``robot_type = "jhu_dvrk_mono"`` (the monocular registry entry in
+#         ``groot_configs.py``; shares the same 20D action/state space as
+#         ``dvrk`` but specifies a single endoscope stream).
+#       * underscored camera names: ``observation.images.endoscope_left``
+#         (matches the ``video_keys = ["video.endoscope_left"]`` in
+#         ``groot_configs.py::jhu_dvrk_mono``).
+#       * flat ``names`` lists (correct per the LeRobot schema).
+#       * fully-specified modality.json state/action entries (explicit
+#         dtype/absolute/rotation_type/original_key).
+#
+# Both schemas are valid and train correctly via their own modality.json.  A
+# strict byte-level comparison flags 4 ``ERROR``s + ~32 ``WARN``s per
+# subset that are all known-benign convention differences.  Rather than
+# suppressing the output (which would hide real structural bugs), we apply
+# a compatibility policy that downgrades each of these *specific* patterns
+# to ``INFO`` with a note.  ``--strict`` disables the policy and restores
+# the original severities.
+
+
+# Embodiment-tag pairs that share the same action/state layout and
+# therefore feed the same training pipeline.  Keep in sync with
+# ``cosmos_predict2/_src/.../gr00t_dreams/groot_configs.py``.
+_COMPATIBLE_ROBOT_TYPE_PAIRS: tuple[frozenset[str], ...] = (
+    # Stereo vs monocular dVRK — both are 20D dual-arm EEF+gripper.
+    frozenset({"dvrk", "jhu_dvrk_mono"}),
+)
+
+
+def _are_compatible_robot_types(a: Any, b: Any) -> bool:
+    if not isinstance(a, str) or not isinstance(b, str):
+        return False
+    return any(frozenset({a, b}) == pair for pair in _COMPATIBLE_ROBOT_TYPE_PAIRS)
+
+
+def _flatten_names(names: Any) -> Any:
+    """If ``names`` is ``[[x, y, ...]]`` (a single-element outer list whose
+    only element is itself a list), return the inner list.  Otherwise
+    return ``names`` unchanged.
+
+    Handles the ``open-h-embodiment/dvrk_zarr_to_lerobot.py`` nesting bug
+    where ``features.<key>.names`` is wrapped in an extra list so that
+    comparing its ``names`` to a correctly-flat list produces a bogus
+    mismatch.
+    """
+    if (
+        isinstance(names, list)
+        and len(names) == 1
+        and isinstance(names[0], list)
+    ):
+        return names[0]
+    return names
+
+
+def _canonicalize_feature_key(key: str) -> str:
+    """Normalize a feature key so that dotted-vs-underscored camera naming
+    under ``observation.images.`` collapses to a single canonical form.
+
+    Used for both video feature keys (``observation.images.endoscope.left``
+    ↔ ``observation.images.endoscope_left``) in :func:`_compare_info` and
+    ``original_key`` comparison in :func:`_compare_modality`.  We only
+    rewrite the suffix after ``observation.images.`` so unrelated ``.``/``_``
+    differences elsewhere still surface as mismatches.
+    """
+    prefix = "observation.images."
+    if key.startswith(prefix):
+        return prefix + key[len(prefix):].replace(".", "_")
+    return key
+
+
+def _are_equivalent_video_feature_keys(a: Any, b: Any) -> bool:
+    """True iff ``a`` and ``b`` are the same feature key modulo the
+    ``observation.images.<CAMERA>`` dotted-vs-underscored naming
+    convention (see :func:`_canonicalize_feature_key`)."""
+    if a == b:
+        return True
+    if not isinstance(a, str) or not isinstance(b, str):
+        return False
+    return _canonicalize_feature_key(a) == _canonicalize_feature_key(b)
+
+
+def _is_optional_modality_field_elision(
+    subfield: str, ref_value: Any, test_value: Any
+) -> bool:
+    """True for ``dtype``/``absolute``/``rotation_type``/``original_key``
+    modality.json fields where one side left it unset (``None``) and the
+    other side set a value.  Not a real structural mismatch — LeRobot
+    applies defaults for missing fields.
+
+    ``start``/``end`` are NOT optional and are never downgraded.
+    """
+    if subfield in ("start", "end"):
+        return False
+    return (ref_value is None) != (test_value is None)
+
+
+# ---------------------------------------------------------------------------
 # Report data classes
 # ---------------------------------------------------------------------------
 
@@ -268,59 +381,145 @@ def _diff_scalar(
     return Diff(severity_if_diff, path, ref_value, test_value)
 
 
-def _compare_info(ref_info: dict, test_info: dict) -> tuple[list[Diff], list[Diff]]:
-    """Structural + content diffs for ``info.json``."""
+def _compare_info(
+    ref_info: dict, test_info: dict, *, strict: bool
+) -> tuple[list[Diff], list[Diff]]:
+    """Structural + content diffs for ``info.json``.
+
+    When ``strict=False`` (default), the known-benign variants documented at
+    the top of this file (``dvrk`` vs ``jhu_dvrk_mono``, nested ``names``)
+    are downgraded to ``INFO``.  Pass ``strict=True`` to see the raw
+    byte-level diff.
+    """
     structural: list[Diff] = []
     content: list[Diff] = []
 
     for key in INFO_STRUCTURAL_KEYS:
-        structural.append(
-            _diff_scalar(
-                f"info.{key}",
-                ref_info.get(key, None),
-                test_info.get(key, None),
-                # Only ``codebase_version`` can reasonably drift without breaking
-                # the pipeline — downgrade to WARN.  The rest are ERROR.
-                severity_if_diff="WARN" if key == "codebase_version" else "ERROR",
-            )
-        )
+        ref_val = ref_info.get(key, None)
+        test_val = test_info.get(key, None)
 
-    # Features (per-key structural comparison).
-    ref_features = ref_info.get("features") or {}
-    test_features = test_info.get("features") or {}
-    feature_keys = sorted(set(ref_features) | set(test_features))
-    for fk in feature_keys:
-        rf = ref_features.get(fk)
-        tf = test_features.get(fk)
-        if rf is None:
+        if ref_val == test_val:
+            structural.append(Diff("OK", f"info.{key}", ref_val, test_val))
+            continue
+
+        # Known-compatible embodiment tags (e.g. ``dvrk`` ↔ ``jhu_dvrk_mono``).
+        if (
+            not strict
+            and key == "robot_type"
+            and _are_compatible_robot_types(ref_val, test_val)
+        ):
             structural.append(
                 Diff(
                     "INFO",
-                    f"info.features.{fk}",
+                    f"info.{key}",
+                    ref_val,
+                    test_val,
+                    note="pipeline-compatible embodiment tags (same action/state space)",
+                )
+            )
+            continue
+
+        # codebase_version drifting isn't fatal.
+        severity = "WARN" if key == "codebase_version" else "ERROR"
+        structural.append(Diff(severity, f"info.{key}", ref_val, test_val))
+
+    # Features.  We pair features across ref/test by their CANONICAL key
+    # (``observation.images.endoscope.left`` ↔
+    # ``observation.images.endoscope_left``) so that a real shape/dtype
+    # mismatch on the "same camera, different naming" cross-schema case
+    # surfaces as an ERROR rather than hiding behind two separate
+    # "present only in X" INFO lines.  Pass ``--strict`` to disable the
+    # pairing and compare by raw key.
+    ref_features = ref_info.get("features") or {}
+    test_features = test_info.get("features") or {}
+
+    def _feature_canonical(k: str) -> str:
+        return k if strict else _canonicalize_feature_key(k)
+
+    ref_by_canon: dict[str, tuple[str, dict]] = {
+        _feature_canonical(k): (k, v) for k, v in ref_features.items()
+    }
+    test_by_canon: dict[str, tuple[str, dict]] = {
+        _feature_canonical(k): (k, v) for k, v in test_features.items()
+    }
+
+    for canon in sorted(set(ref_by_canon) | set(test_by_canon)):
+        ref_pair = ref_by_canon.get(canon)
+        test_pair = test_by_canon.get(canon)
+        if ref_pair is None:
+            test_key, tf = test_pair  # type: ignore[misc]
+            structural.append(
+                Diff(
+                    "INFO",
+                    f"info.features.{test_key}",
                     None,
                     tf,
                     note="present in test only",
                 )
             )
             continue
-        if tf is None:
+        if test_pair is None:
+            ref_key, rf = ref_pair
             structural.append(
                 Diff(
                     "INFO",
-                    f"info.features.{fk}",
+                    f"info.features.{ref_key}",
                     rf,
                     None,
                     note="present in reference only",
                 )
             )
             continue
-        for subkey in FEATURE_STRUCTURAL_KEYS:
+
+        ref_key, rf = ref_pair
+        test_key, tf = test_pair
+
+        # Label the row with both keys when they differ, so the reader
+        # sees which two features got paired.
+        label = ref_key if ref_key == test_key else f"{ref_key} ↔ {test_key}"
+
+        # If the paired keys aren't identical (e.g. ``endoscope.left`` ↔
+        # ``endoscope_left``), surface that as its own INFO entry.
+        if ref_key != test_key:
             structural.append(
-                _diff_scalar(
-                    f"info.features.{fk}.{subkey}",
-                    rf.get(subkey),
-                    tf.get(subkey),
+                Diff(
+                    "INFO",
+                    f"info.features.{label}",
+                    ref_key,
+                    test_key,
+                    note="paired by canonical name (dotted↔underscored)",
                 )
+            )
+
+        for subkey in FEATURE_STRUCTURAL_KEYS:
+            ref_sub = rf.get(subkey)
+            test_sub = tf.get(subkey)
+
+            if ref_sub == test_sub:
+                structural.append(
+                    Diff("OK", f"info.features.{label}.{subkey}", ref_sub, test_sub)
+                )
+                continue
+
+            # Flatten the ``[[...]]`` nesting bug before comparing ``names``.
+            if (
+                not strict
+                and subkey == "names"
+                and _flatten_names(ref_sub) == _flatten_names(test_sub)
+            ):
+                structural.append(
+                    Diff(
+                        "INFO",
+                        f"info.features.{label}.{subkey}",
+                        ref_sub,
+                        test_sub,
+                        note="semantically equivalent after flattening [[...]] wrapper",
+                    )
+                )
+                continue
+
+            structural.append(
+                Diff("ERROR", f"info.features.{label}.{subkey}", ref_sub, test_sub)
             )
 
     # Content-only keys (expected to differ).
@@ -338,12 +537,15 @@ def _compare_info(ref_info: dict, test_info: dict) -> tuple[list[Diff], list[Dif
 
 
 def _compare_modality(
-    ref: Optional[dict], test: Optional[dict]
+    ref: Optional[dict], test: Optional[dict], *, strict: bool
 ) -> list[Diff]:
     """Structural diff for ``meta/modality.json``.
 
-    Returns ``[]`` if neither side has a modality.json; returns a single
-    ``INFO`` diff if only one side has one.
+    When ``strict=False`` (default), optional-field elision (one side sets a
+    value, the other leaves it ``None``) is downgraded to ``INFO``, and
+    dotted-vs-underscored ``original_key`` variants are likewise reported
+    as ``INFO``.  Real structural issues (mismatched ``start``/``end``
+    slice bounds) stay ``ERROR``.
     """
     if ref is None and test is None:
         return [Diff("INFO", "modality.json", None, None, note="absent in both")]
@@ -370,17 +572,36 @@ def _compare_modality(
                 out.append(Diff("INFO", key_path, rsk, None, note="reference only"))
                 continue
             for subfield in MODALITY_SA_STRUCTURAL_KEYS:
-                out.append(
-                    _diff_scalar(
-                        f"{key_path}.{subfield}",
-                        rsk.get(subfield),
-                        tsk.get(subfield),
-                        # WARN on rotation_type/absolute/dtype differences
-                        # (might still be trainable); ERROR on index mismatch
-                        # (slicing will be wrong).
-                        severity_if_diff="ERROR" if subfield in ("start", "end") else "WARN",
+                ref_val = rsk.get(subfield)
+                test_val = tsk.get(subfield)
+
+                if ref_val == test_val:
+                    out.append(Diff("OK", f"{key_path}.{subfield}", ref_val, test_val))
+                    continue
+
+                # One side just doesn't specify this optional field — not a
+                # structural issue (LeRobot applies defaults).
+                if (
+                    not strict
+                    and _is_optional_modality_field_elision(subfield, ref_val, test_val)
+                ):
+                    which_missing = "reference" if ref_val is None else "test"
+                    out.append(
+                        Diff(
+                            "INFO",
+                            f"{key_path}.{subfield}",
+                            ref_val,
+                            test_val,
+                            note=f"optional field omitted on the {which_missing} side",
+                        )
                     )
-                )
+                    continue
+
+                # ``start``/``end`` slicing mismatches are always ERROR — the
+                # training pipeline reads the wrong columns.  Everything else
+                # defaults to WARN (pipeline might still work).
+                severity = "ERROR" if subfield in ("start", "end") else "WARN"
+                out.append(Diff(severity, f"{key_path}.{subfield}", ref_val, test_val))
 
     # video subkeys.
     ref_video = ref.get("video") or {}
@@ -397,13 +618,31 @@ def _compare_modality(
             out.append(Diff("INFO", key_path, rsk, None, note="reference only"))
             continue
         for subfield in MODALITY_VIDEO_STRUCTURAL_KEYS:
-            out.append(
-                _diff_scalar(
-                    f"{key_path}.{subfield}",
-                    rsk.get(subfield),
-                    tsk.get(subfield),
+            ref_val = rsk.get(subfield)
+            test_val = tsk.get(subfield)
+
+            if ref_val == test_val:
+                out.append(Diff("OK", f"{key_path}.{subfield}", ref_val, test_val))
+                continue
+
+            # Dotted ↔ underscored camera naming under ``observation.images.``
+            if (
+                not strict
+                and subfield == "original_key"
+                and _are_equivalent_video_feature_keys(ref_val, test_val)
+            ):
+                out.append(
+                    Diff(
+                        "INFO",
+                        f"{key_path}.{subfield}",
+                        ref_val,
+                        test_val,
+                        note="same feature under dotted↔underscored naming convention",
+                    )
                 )
-            )
+                continue
+
+            out.append(Diff("ERROR", f"{key_path}.{subfield}", ref_val, test_val))
 
     return out
 
@@ -588,13 +827,19 @@ def _file_presence(ref: Path, test: Path, meta_name: str) -> Diff:
 # ---------------------------------------------------------------------------
 
 
-def compare_one(ref: Path, test: Path, test_name: str) -> DatasetReport:
-    """Compare one ``test`` dataset against the ``ref`` reference dataset."""
+def compare_one(
+    ref: Path, test: Path, test_name: str, *, strict: bool = False
+) -> DatasetReport:
+    """Compare one ``test`` dataset against the ``ref`` reference dataset.
+
+    Pass ``strict=True`` to disable the compatibility policy (every
+    byte-level diff becomes ``ERROR``/``WARN``).
+    """
     report = DatasetReport(test_name=test_name)
 
     ref_info = _load_json(ref / "meta/info.json")
     test_info = _load_json(test / "meta/info.json")
-    info_structural, info_content = _compare_info(ref_info, test_info)
+    info_structural, info_content = _compare_info(ref_info, test_info, strict=strict)
     report.structural.extend(info_structural)
     report.content.extend(info_content)
 
@@ -602,7 +847,7 @@ def compare_one(ref: Path, test: Path, test_name: str) -> DatasetReport:
     test_mod_path = test / "meta/modality.json"
     ref_mod = _load_json(ref_mod_path) if ref_mod_path.exists() else None
     test_mod = _load_json(test_mod_path) if test_mod_path.exists() else None
-    report.structural.extend(_compare_modality(ref_mod, test_mod))
+    report.structural.extend(_compare_modality(ref_mod, test_mod, strict=strict))
 
     ref_parquet, ref_mp4s = _first_episode_files(ref, ref_info)
     test_parquet, test_mp4s = _first_episode_files(test, test_info)
@@ -707,12 +952,31 @@ def _print_report(report: DatasetReport, verbose: bool) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _print_compat_policy_banner(strict: bool) -> None:
+    """One-line banner explaining what the current compat policy does."""
+    if strict:
+        print(
+            "Compat policy: STRICT — every byte-level diff is reported "
+            "as ERROR/WARN with no normalization."
+        )
+    else:
+        print(
+            "Compat policy: default — known-benign variants downgraded to ℹ INFO:\n"
+            "  • robot_type 'dvrk' ↔ 'jhu_dvrk_mono' (same 20D action space)\n"
+            "  • features.*.names '[[...]]' ↔ '[...]'  (open-h-embodiment nesting bug)\n"
+            "  • observation.images.<cam>.<side> ↔ <cam>_<side>  (camera naming convention)\n"
+            "  • optional modality.json fields set on one side and omitted on the other\n"
+            "  Run with --strict to disable the policy."
+        )
+
+
 def main(
     reference_dir: Path,
     test_dir: Optional[Path] = None,
     tests_root: Optional[Path] = None,
     tests: Optional[list[str]] = None,
     verbose: bool = False,
+    strict: bool = False,
 ) -> None:
     """Compare newly-converted LeRobot subsets to a reference dataset.
 
@@ -730,6 +994,10 @@ def main(
             Defaults to *every* direct subdirectory of ``--tests-root``.
         verbose: Also print ``OK`` entries (matching fields) — by default we
             only show non-matching rows to keep the report compact.
+        strict: Disable the compatibility policy (see banner at top of
+            output).  Byte-level diffs that are normally downgraded to
+            ``INFO`` stay as ``ERROR``/``WARN``.  Useful when you suspect a
+            real schema drift masquerading as a known variant.
     """
     if not reference_dir.exists():
         print(f"ERROR: reference dir does not exist: {reference_dir}")
@@ -759,12 +1027,13 @@ def main(
     print(f"Reference: {reference_dir}")
     if tests_root is not None:
         print(f"Tests root: {tests_root}  ({len(test_pairs)} datasets)")
+    _print_compat_policy_banner(strict)
     print()
 
     reports: list[DatasetReport] = []
     for test_name, test_path in test_pairs:
         try:
-            report = compare_one(reference_dir, test_path, test_name)
+            report = compare_one(reference_dir, test_path, test_name, strict=strict)
         except FileNotFoundError as e:
             print(f"\n=== {test_name} — ❌ LOAD FAILED ===")
             print(f"  {e}")
