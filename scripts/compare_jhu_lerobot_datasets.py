@@ -189,6 +189,81 @@ def _flatten_names(names: Any) -> Any:
     return names
 
 
+# Axis-name synonyms that the Cosmos pipeline treats interchangeably (see the
+# ``for h_name in ["height", "h"]: ... for c_name in ["channel", "channels", "c"]``
+# lookup in ``LeRobotSingleDataset._get_metadata`` in
+# ``cosmos_predict2._src.predict2.action.datasets.gr00t_dreams.data.dataset``).
+# Different converter scripts picked different spellings:
+#   - ``open-h-embodiment/dvrk_zarr_to_lerobot.py`` → ``["height", "width", "channel"]``
+#   - our converter / most recent LeRobot examples → ``["height", "width", "channels"]``
+# They're equivalent at training time; only byte-level comparison notices.
+_AXIS_SYNONYM_CANONICAL: dict[str, str] = {
+    "h": "height",
+    "height": "height",
+    "w": "width",
+    "width": "width",
+    "c": "channel",
+    "channel": "channel",
+    "channels": "channel",
+}
+
+
+def _canonicalize_video_axis_names(names: Any) -> Any:
+    """Map axis-name synonyms in a video feature's ``names`` to a canonical form.
+
+    Only applied to ``dtype == "video"`` features; state/action ``names`` are
+    semantically different (they label physical channels like ``psm1_jaw``)
+    and must match literally.
+    """
+    if not isinstance(names, list):
+        return names
+    return [
+        _AXIS_SYNONYM_CANONICAL.get(n, n) if isinstance(n, str) else n
+        for n in names
+    ]
+
+
+def _names_are_equivalent(
+    ref: Any, test: Any, *, is_video: bool
+) -> tuple[bool, Optional[str]]:
+    """Return ``(equivalent, note_if_downgraded)`` for a feature-level
+    ``names`` comparison.
+
+    Applies, in order:
+
+    1. Byte-level equality.
+    2. Flatten the ``[[...]]`` wrapper (open-h-embodiment nesting bug).
+    3. For video features, canonicalize axis-name synonyms
+       (``channel`` / ``channels`` / ``c``, etc.).
+
+    Returns the reason for the downgrade in the ``note`` slot so the
+    printed INFO line can be self-explanatory.
+    """
+    if ref == test:
+        return True, None
+    ref_flat = _flatten_names(ref)
+    test_flat = _flatten_names(test)
+    nested_wrapper_differed = ref != ref_flat or test != test_flat
+    if ref_flat == test_flat:
+        return True, "semantically equivalent after flattening [[...]] wrapper"
+    if is_video:
+        ref_norm = _canonicalize_video_axis_names(ref_flat)
+        test_norm = _canonicalize_video_axis_names(test_flat)
+        if ref_norm == test_norm:
+            if nested_wrapper_differed:
+                note = (
+                    "equivalent after flattening [[...]] wrapper and normalizing "
+                    "video axis-name synonyms (e.g. channel↔channels)"
+                )
+            else:
+                note = (
+                    "video axis-name synonyms normalized "
+                    "(e.g. channel↔channels, h↔height, w↔width)"
+                )
+            return True, note
+    return False, None
+
+
 def _canonicalize_feature_key(key: str) -> str:
     """Normalize a feature key so that dotted-vs-underscored camera naming
     under ``observation.images.`` collapses to a single canonical form.
@@ -491,6 +566,12 @@ def _compare_info(
                 )
             )
 
+        # ``dtype`` lookup is used by the ``names`` comparator to decide
+        # whether axis-name synonym normalization applies (video features
+        # only).  Grab both sides; if they differ, the ``dtype`` subfield
+        # comparison below surfaces that as its own ERROR.
+        is_video = (rf.get("dtype") == "video") and (tf.get("dtype") == "video")
+
         for subkey in FEATURE_STRUCTURAL_KEYS:
             ref_sub = rf.get(subkey)
             test_sub = tf.get(subkey)
@@ -501,22 +582,23 @@ def _compare_info(
                 )
                 continue
 
-            # Flatten the ``[[...]]`` nesting bug before comparing ``names``.
-            if (
-                not strict
-                and subkey == "names"
-                and _flatten_names(ref_sub) == _flatten_names(test_sub)
-            ):
-                structural.append(
-                    Diff(
-                        "INFO",
-                        f"info.features.{label}.{subkey}",
-                        ref_sub,
-                        test_sub,
-                        note="semantically equivalent after flattening [[...]] wrapper",
-                    )
+            # Known-benign ``names`` variants: ``[[...]]`` nesting wrapper
+            # and/or video axis-name synonyms (``channel``/``channels``).
+            if not strict and subkey == "names":
+                equivalent, note = _names_are_equivalent(
+                    ref_sub, test_sub, is_video=is_video
                 )
-                continue
+                if equivalent:
+                    structural.append(
+                        Diff(
+                            "INFO",
+                            f"info.features.{label}.{subkey}",
+                            ref_sub,
+                            test_sub,
+                            note=note or "equivalent",
+                        )
+                    )
+                    continue
 
             structural.append(
                 Diff("ERROR", f"info.features.{label}.{subkey}", ref_sub, test_sub)
@@ -964,6 +1046,7 @@ def _print_compat_policy_banner(strict: bool) -> None:
             "Compat policy: default — known-benign variants downgraded to ℹ INFO:\n"
             "  • robot_type 'dvrk' ↔ 'jhu_dvrk_mono' (same 20D action space)\n"
             "  • features.*.names '[[...]]' ↔ '[...]'  (open-h-embodiment nesting bug)\n"
+            "  • video axis names 'channel' ↔ 'channels' (+ 'h'/'w'/'c' shortcuts)\n"
             "  • observation.images.<cam>.<side> ↔ <cam>_<side>  (camera naming convention)\n"
             "  • optional modality.json fields set on one side and omitted on the other\n"
             "  Run with --strict to disable the policy."
