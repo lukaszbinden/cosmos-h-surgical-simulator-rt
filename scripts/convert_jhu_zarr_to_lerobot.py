@@ -125,6 +125,7 @@ Dependencies
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import json
 import multiprocessing
@@ -137,7 +138,7 @@ import traceback
 from concurrent.futures import Future, ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Iterator, Optional, Sequence
 
 import cv2
 import numcodecs
@@ -272,6 +273,202 @@ def _register_pi_jpeg_codec() -> None:
 
 
 _register_pi_jpeg_codec()
+
+
+# ---------------------------------------------------------------------------
+# SVT-AV1 stderr silencer
+# ---------------------------------------------------------------------------
+# SVT-AV1 writes its own diagnostic messages (the ``SVT [config]:`` banner
+# that prints at every encoder startup, and the harmless
+# ``Svt[warn]: Failed to set thread priority: Invalid argument`` that shows
+# up whenever the process lacks ``CAP_SYS_NICE``) directly to the C-level
+# stderr (fd 2), bypassing PyAV's ``av.logging`` system entirely.  That means
+# the ``log_level`` parameter of ``lerobot.datasets.video_utils.encode_video_frames``
+# cannot silence them.
+#
+# For bulk conversions (hundreds of episodes × potentially multiple shard
+# workers) this chatter both clobbers our own progress bars and makes the
+# output mostly useless.  We monkey-patch ``encode_video_frames`` to wrap
+# its single call site with an OS-level redirect of fd 2 to ``/dev/null``
+# for the duration of each encode.  The redirect is only active while the
+# encoder runs, so legitimate errors from the rest of the pipeline are
+# unaffected.
+#
+# Set ``JHU_VERBOSE_ENCODER=1`` in the environment to disable the patch and
+# see the full SVT-AV1 output (useful for debugging an encoder crash).
+
+
+@contextlib.contextmanager
+def _suppress_fd_stderr() -> "Iterator[None]":
+    """Redirect OS-level fd 2 (stderr) to /dev/null for the duration of the block.
+
+    Works below Python's ``sys.stderr`` abstraction, so it silences writes
+    from native libraries (SVT-AV1, libav internals, etc.) that call
+    ``fprintf(stderr, ...)`` directly.  Restores fd 2 unconditionally on
+    exit, even if the block raises.
+    """
+    sys.stderr.flush()
+    saved_fd = os.dup(2)
+    try:
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(devnull_fd, 2)
+            yield
+        finally:
+            os.close(devnull_fd)
+    finally:
+        sys.stderr.flush()
+        os.dup2(saved_fd, 2)
+        os.close(saved_fd)
+
+
+def _install_svt_stderr_quiet() -> None:
+    """Monkey-patch ``encode_video_frames`` so every encode runs under
+    :func:`_suppress_fd_stderr`.
+
+    Patches both ``lerobot.datasets.video_utils.encode_video_frames`` and
+    ``lerobot.datasets.lerobot_dataset.encode_video_frames`` because the
+    latter is a name-bound import (``from .video_utils import
+    encode_video_frames``) whose identity was captured at import time.
+
+    Runs unconditionally at module load, which also means every ``spawn``
+    worker re-runs it when it re-imports this script — so SVT output is
+    silenced in all processes.
+    """
+    if os.environ.get("JHU_VERBOSE_ENCODER", "0") == "1":
+        return
+
+    from lerobot.datasets import lerobot_dataset as _lrd
+    from lerobot.datasets import video_utils as _vu
+
+    original = _vu.encode_video_frames
+    # Idempotency guard: if this module is imported twice (e.g. by pytest)
+    # we don't want to wrap the wrapper.
+    if getattr(original, "_jhu_svt_quiet", False):
+        return
+
+    @functools.wraps(original)
+    def quiet_encode(*args, **kwargs):  # type: ignore[no-untyped-def]
+        with _suppress_fd_stderr():
+            return original(*args, **kwargs)
+
+    quiet_encode._jhu_svt_quiet = True  # type: ignore[attr-defined]
+    _vu.encode_video_frames = quiet_encode
+    _lrd.encode_video_frames = quiet_encode
+
+
+_install_svt_stderr_quiet()
+
+
+def _svt_silencer_active() -> bool:
+    """Return True iff we want to silence SVT-AV1's direct stderr writes.
+
+    Honours ``JHU_VERBOSE_ENCODER=1`` so that the belt-and-suspenders wrapper
+    around ``save_episode`` below can be disabled in the same way as the
+    module-level monkey-patch.
+    """
+    return os.environ.get("JHU_VERBOSE_ENCODER", "0") != "1"
+
+
+def _save_episode_quiet(dataset: LeRobotDataset) -> None:
+    """Call ``dataset.save_episode()`` with SVT-AV1's direct-stderr chatter
+    silenced for the full duration of the call.
+
+    This is a defence in depth on top of :func:`_install_svt_stderr_quiet`.
+    In some LeRobot build/setup combinations the monkey-patch of the module
+    attribute doesn't catch every path that ends up initializing the
+    SVT-AV1 encoder (e.g., if ``encode_video_frames`` is resolved via a
+    captured reference we don't rebind).  Wrapping at the LeRobot public
+    API boundary instead guarantees silence regardless of the internal
+    dispatch chain — whether LeRobot inlines ``encode_video_frames``,
+    routes through ``encode_episode_videos``, goes through
+    ``batch_encode_videos``, or does something else.
+
+    Exceptions propagate out of the ``with`` block so the context manager
+    restores fd 2 before our caller's ``except`` handler runs, which means
+    tracebacks remain visible.
+    """
+    if _svt_silencer_active():
+        with _suppress_fd_stderr():
+            dataset.save_episode()
+    else:
+        dataset.save_episode()
+
+
+def _report_length_mismatches(dataset_name: str, results: list[dict]) -> None:
+    """Log a summary of any kinematics/image stream-length mismatches.
+
+    In the source zarrs, ``kinematics`` and ``left`` occasionally differ in
+    length (a few frames either way — most commonly the dVRK kinematics
+    stream extends past the last recorded image on cutting-style tasks).
+    :func:`_decode_episode` handles this by taking
+    ``min(n_kin, n_img)``, which means a few trailing rows/frames are
+    silently dropped.  That's usually the right call, but it can also mask a
+    real data problem if the mismatch is huge.
+
+    This function walks the per-episode result list, tallies how many
+    episodes had a mismatch, the total frames dropped, and prints up to
+    five of the worst offenders so the user can sanity-check them.  The
+    report is at most a few lines even when every episode has a minor
+    mismatch.
+    """
+    if not results:
+        return
+
+    mismatches = [
+        r for r in results
+        if int(r.get("n_kin_source", 0)) != int(r.get("n_img_source", 0))
+    ]
+    if not mismatches:
+        print(f"[{dataset_name}] all {len(results)} episodes: kinematics/image lengths match")
+        return
+
+    # Frames dropped = abs(n_kin - n_img) per mismatched episode.
+    drops = [
+        abs(int(r["n_kin_source"]) - int(r["n_img_source"])) for r in mismatches
+    ]
+    total_dropped = sum(drops)
+    total_kept = sum(int(r["num_frames"]) for r in results)
+    pct = 100.0 * total_dropped / max(1, total_kept + total_dropped)
+    print(
+        f"[{dataset_name}] length mismatches: {len(mismatches)}/{len(results)} episodes, "
+        f"dropped {total_dropped} frames "
+        f"(~{pct:.2f}% of source data; truncated via min(n_kin, n_img))"
+    )
+
+    # Show the five worst offenders so the user can spot-check them.
+    worst = sorted(mismatches, key=lambda r: -abs(r["n_kin_source"] - r["n_img_source"]))
+    for r in worst[:5]:
+        print(
+            f"  drop={abs(r['n_kin_source'] - r['n_img_source']):>4d} "
+            f"(n_kin={r['n_kin_source']}, n_img={r['n_img_source']}, "
+            f"kept={r['num_frames']}) {r['zip_path']}"
+        )
+
+
+def _stop_image_writer_safe(dataset: LeRobotDataset) -> None:
+    """Best-effort shutdown of a ``LeRobotDataset``'s image-writer workers.
+
+    LeRobot spawns a pool of image-writer processes (``image_writer_processes``)
+    in ``LeRobotDataset.create`` and leaves them running until the user calls
+    :meth:`LeRobotDataset.stop_image_writer` or the dataset object is GC'd.
+    In our shard workers and sequential path neither happens in time: the
+    worker process exits with the pool still alive, leaking their
+    synchronization semaphores (hence the
+    ``resource_tracker: There appear to be N leaked semaphore objects``
+    warning at program shutdown).
+
+    Call this at the end of every conversion path to stop the writer pool
+    cleanly.  Errors are swallowed because cleanup must not mask a real
+    conversion error on the exit path.
+    """
+    stop = getattr(dataset, "stop_image_writer", None)
+    if stop is None:
+        return
+    try:
+        stop()
+    except Exception as e:  # noqa: BLE001
+        print(f"[warn] stop_image_writer failed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -432,10 +629,28 @@ class EpisodePayload:
     states: np.ndarray  # (num_frames, len(STATES_NAME)) float32
     actions: np.ndarray  # (num_frames, len(ACTIONS_NAME)) float32
     error: Optional[str] = None
+    # Source zarr sizes before ``min(n_kin, n_img)`` truncation, so callers
+    # can detect and account for silent length mismatches between the
+    # kinematics stream and the left-endoscope stream.  For a clean episode
+    # these equal :attr:`num_frames`; a mismatch means we dropped some
+    # trailing rows/frames.  ``0`` is a sentinel for "unknown / decode
+    # failed before we read the stream length".
+    n_kin_source: int = 0
+    n_img_source: int = 0
 
     @property
     def num_frames(self) -> int:
         return int(self.frames.shape[0])
+
+    @property
+    def length_mismatch(self) -> int:
+        """Number of rows/frames silently dropped by ``min(n_kin, n_img)``.
+
+        Positive value ⇒ the shorter of the two streams truncated the other.
+        """
+        if self.n_kin_source == 0 and self.n_img_source == 0:
+            return 0
+        return abs(int(self.n_kin_source) - int(self.n_img_source))
 
 
 def _empty_payload(episode: EpisodeRef, error: str) -> EpisodePayload:
@@ -505,6 +720,8 @@ def _decode_episode(episode: EpisodeRef) -> EpisodePayload:
                 states=states,
                 actions=actions,
                 error=None,
+                n_kin_source=int(n_kin),
+                n_img_source=int(n_img),
             )
         finally:
             store.close()
@@ -880,7 +1097,7 @@ def _sequential_convert(
         try:
             payload = _decode_episode(episode)
             n = _ingest_payload(dataset, payload)
-            dataset.save_episode()
+            _save_episode_quiet(dataset)
             results.append(
                 {
                     "orig_idx": int(orig_idx),
@@ -888,6 +1105,11 @@ def _sequential_convert(
                     "num_frames": int(n),
                     "instruction": episode.instruction,
                     "zip_path": str(episode.zip_path),
+                    # Source-zarr stream lengths before min() truncation — used
+                    # by the post-conversion mismatch summary so silent frame
+                    # drops don't go unnoticed.
+                    "n_kin_source": int(payload.n_kin_source),
+                    "n_img_source": int(payload.n_img_source),
                 }
             )
         except Exception as e:  # noqa: BLE001 — last line of defence per episode
@@ -973,14 +1195,22 @@ def _worker_convert_shard(
 
     log_prefix = f"[shard_{shard_idx:04d}]"
     start = time.time()
-    # Don't print tqdm bars from inside workers — they'd clobber each other
-    # (and the main progress bar) in the terminal.
-    results = _sequential_convert(
-        shard_items,
-        dataset=dataset,
-        log_prefix=log_prefix,
-        show_progress=False,
-    )
+    try:
+        # Don't print tqdm bars from inside workers — they'd clobber each
+        # other (and the main progress bar) in the terminal.
+        results = _sequential_convert(
+            shard_items,
+            dataset=dataset,
+            log_prefix=log_prefix,
+            show_progress=False,
+        )
+    finally:
+        # Tear down LeRobot's image-writer subprocess pool before the worker
+        # exits.  Without this the OS-level semaphores / sync primitives
+        # owned by the writer pool leak (``resource_tracker: There appear
+        # to be N leaked semaphore objects at shutdown``) once the main
+        # process joins the pool.
+        _stop_image_writer_safe(dataset)
     elapsed = time.time() - start
 
     print(
@@ -1313,12 +1543,18 @@ def convert_subset(
             batch_encoding_size=batch_encoding_size,
         )
         indexed = list(enumerate(episodes))
-        results = _sequential_convert(
-            indexed,
-            dataset=dataset,
-            log_prefix=f"[{dataset_name}]",
-            show_progress=True,
-        )
+        try:
+            results = _sequential_convert(
+                indexed,
+                dataset=dataset,
+                log_prefix=f"[{dataset_name}]",
+                show_progress=True,
+            )
+        finally:
+            # Explicit teardown of LeRobot's image-writer pool — see
+            # _stop_image_writer_safe docstring for context on why.
+            _stop_image_writer_safe(dataset)
+        all_results: list[dict] = list(results)
         saved_episodes = len(results)
         total_frames = sum(int(r["num_frames"]) for r in results)
         chunks_size = int(dataset.meta.info.get("chunks_size", 1000))
@@ -1389,6 +1625,9 @@ def convert_subset(
             dataset_name=dataset_name,
         )
         saved_episodes = n_saved
+        # Flatten per-episode results across shards for the integrity
+        # summary below.  Order doesn't matter for the summary counts.
+        all_results = [r for sm in shard_metas for r in sm["results"]]
 
         # Cleanup shard temp.
         shutil.rmtree(shards_root, ignore_errors=True)
@@ -1401,6 +1640,8 @@ def convert_subset(
         f"({total_frames} frames) in {elapsed:.1f}s "
         f"({throughput_ep:.2f} ep/s, {throughput_fps:.1f} fps)"
     )
+
+    _report_length_mismatches(dataset_name, all_results)
 
     if saved_episodes == 0:
         print(f"[{dataset_name}] no episodes saved, skipping post-processing")
