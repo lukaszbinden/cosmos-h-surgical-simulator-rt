@@ -627,6 +627,88 @@ class LeRobotSingleDataset(Dataset):
             # Get all parquet files in the dataset paths
             parquet_files = list((self.dataset_path).glob(LE_ROBOT_DATA_FILENAME))
             le_statistics = calculate_dataset_statistics(parquet_files)
+
+        # --------------------------------------------------------------
+        # Guard: verify the ``timestep_interval`` stamped in
+        # ``stats_cosmos.json`` (written by ``compute_openh_action_stats.py``)
+        # matches whatever stride the training pipeline will actually use
+        # (``EMBODIMENT_REGISTRY[tag]["timestep_interval"]``).
+        #
+        # Post-transform action magnitudes scale with the stride (per-step
+        # deltas grow/shrink proportionally), so a stride mismatch silently
+        # corrupts normalization at training time.  We raise a very loud
+        # ValueError so it can't be missed.
+        #
+        # Scope of the check:
+        #   - Only runs for the Open-H ``stats_cosmos.json`` path — CMR
+        #     Versius (``stats_cosmos-44D.json``) has its own compute script
+        #     (``compute_cmr_action_stats.py``) and is not stamped yet.
+        #   - Legacy stats files produced before the stamp was added will
+        #     not carry the ``timestep_interval`` key: in that case we emit
+        #     a warning rather than raising so existing datasets keep
+        #     loading — re-run the compute script to clear the warning.
+        # --------------------------------------------------------------
+        if (
+            self.tag in self._get_open_h_tags()
+            and stats_path.name == "stats_cosmos.json"
+        ):
+            stamped_stride = le_statistics.get("timestep_interval")
+            # Lazy import to avoid circular dep (groot_configs imports
+            # ModalityConfig from this module — see _get_open_h_tags above
+            # for the same pattern).
+            from cosmos_predict2._src.predict2.action.datasets.gr00t_dreams.groot_configs import (
+                EMBODIMENT_REGISTRY,
+            )
+            registry_entry = EMBODIMENT_REGISTRY.get(self.tag)
+            registry_stride = (
+                registry_entry.get("timestep_interval") if registry_entry else None
+            )
+
+            if stamped_stride is None:
+                # Older stats file, pre-stamping.  Not fatal — the stats
+                # might still be correct, we just can't verify.
+                print(
+                    f"{_get_rank_prefix()}WARNING: {stats_path} has no "
+                    f"'timestep_interval' stamp. Cannot verify it matches "
+                    f"EMBODIMENT_REGISTRY['{self.tag}']['timestep_interval']="
+                    f"{registry_stride}. Re-run "
+                    f"'python scripts/compute_openh_action_stats.py "
+                    f"--dataset-path {self.dataset_path} "
+                    f"--embodiment {self.tag}' to refresh."
+                )
+            elif (
+                registry_stride is not None
+                and int(stamped_stride) != int(registry_stride)
+            ):
+                raise ValueError(
+                    f"\n{'=' * 80}\n"
+                    f"STATS / REGISTRY STRIDE MISMATCH\n"
+                    f"{'=' * 80}\n"
+                    f"Dataset:    {self.dataset_path}\n"
+                    f"Embodiment: {self.tag}\n\n"
+                    f"{stats_path.name} was computed with "
+                    f"timestep_interval={stamped_stride}, but the training "
+                    f"pipeline will use "
+                    f"EMBODIMENT_REGISTRY['{self.tag}']['timestep_interval']="
+                    f"{registry_stride}.\n\n"
+                    f"Post-transform action magnitudes scale with the "
+                    f"stride, so this mismatch would silently corrupt "
+                    f"normalization at training time.\n\n"
+                    f"Fix options:\n"
+                    f"  (A) Recompute stats with the registry's stride:\n"
+                    f"        python scripts/compute_openh_action_stats.py \\\n"
+                    f"            --dataset-path {self.dataset_path} \\\n"
+                    f"            --embodiment {self.tag}\n"
+                    f"      (This will use the registry default of "
+                    f"{registry_stride}.)\n\n"
+                    f"  (B) Update the registry to match the stamp:\n"
+                    f"        EMBODIMENT_REGISTRY['{self.tag}']"
+                    f"['timestep_interval'] = {stamped_stride}\n"
+                    f"      (Use this if {stamped_stride} is the intended "
+                    f"stride.)\n"
+                    f"{'=' * 80}"
+                )
+
         dataset_statistics = {}
         stats_log = {"per_key": [], "index_based": [], "skipped": []}
         for our_modality in ["state", "action"]:
