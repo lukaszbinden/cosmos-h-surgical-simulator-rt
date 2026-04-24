@@ -56,6 +56,7 @@ class AbstractCheckpointer(ABC):
         self.save_thread = None
         self.verbose = config_checkpoint.verbose
         self.keys_not_to_resume = config_checkpoint.keys_not_to_resume
+        self.keys_to_skip_loading = getattr(config_checkpoint, "keys_to_skip_loading", [])
         self.broadcast_via_filesystem = config_checkpoint.broadcast_via_filesystem
         # Create the object store client interface.
         if config_checkpoint.load_from_object_store.enabled:

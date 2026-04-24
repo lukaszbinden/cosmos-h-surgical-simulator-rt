@@ -288,6 +288,13 @@ class CheckpointConfig:
     verbose: bool = True
     # keys not to resume from the checkpoint, choices: ["model", "optim", "scheduler", "trainer"]
     keys_not_to_resume: list[str] = []
+    # When loading checkpoints from `load_path`, this list serves as a filter
+    # to bypass the loading for specific model parameters. A key is considered
+    # a match - and thus its loading is skipped - if it matches any element of
+    # this list exactly. Useful for fine-tuning from a base checkpoint while
+    # letting specific layers re-initialize (e.g. an action embedder whose shape
+    # changed between pretrain and fine-tune).
+    keys_to_skip_loading: list[str] = []
     # Whether to use the local filesystem for broadcasting checkpoint data (used for Tensor Parallel Checkpointer).
     broadcast_via_filesystem: bool = False
     load_ema_to_reg: bool = False

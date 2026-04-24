@@ -571,7 +571,7 @@ class Video2WorldInference:
         # Generate latent samples using the diffusion model
         # Video should be of shape torch.Size([1, 3, 93, 192, 320]) # Note: Shape check comment
         log.info("[Memory Optimization] Starting latent sample generation")
-        if self.model.config.use_lora:
+        if getattr(self.model.config, "use_lora", False):
             generate_samples = self.model.generate_samples_from_batch_lora
         else:
             generate_samples = self.model.generate_samples_from_batch
@@ -809,11 +809,11 @@ class Video2WorldInference:
                 ).to(chunk_input.dtype)
                 chunk_input = torch.cat([chunk_input, padding], dim=2)
 
-            # Determine num_conditional_frames for this chunk
+            # Determine num_latent_conditional for the model (latent space) for this chunk.
             if chunk_idx == 0:
-                chunk_num_conditional = num_latent_conditional_frames
+                chunk_latent_conditional = num_latent_conditional_frames
             else:
-                chunk_num_conditional = chunk_overlap
+                chunk_latent_conditional = self.model.tokenizer.get_latent_num_frames(chunk_overlap)
 
             # Generate chunk
             chunk_video = self.generate_vid2world(
@@ -821,7 +821,7 @@ class Video2WorldInference:
                 input_path=chunk_input,
                 guidance=guidance,
                 num_video_frames=model_required_frames,
-                num_latent_conditional_frames=chunk_num_conditional,
+                num_latent_conditional_frames=chunk_latent_conditional,
                 resolution=resolution,
                 seed=seed + chunk_idx,
                 negative_prompt=negative_prompt,
@@ -844,12 +844,9 @@ class Video2WorldInference:
             if chunk_idx < num_chunks - 1:
                 # Convert generated chunk from [-1, 1] to [0, 255] uint8 range
                 chunk_video_uint8 = ((chunk_video / 2.0 + 0.5).clamp(0.0, 1.0) * 255.0).to(torch.uint8)
-                # Update the input video with generated frames for conditioning next chunk
-                update_start = start_frame + chunk_num_conditional
+                update_start = start_frame + chunk_overlap
                 update_end = end_frame
-                current_input_video[:, :, update_start:update_end, :, :] = chunk_video_uint8[
-                    :, :, chunk_num_conditional:, :, :
-                ]
+                current_input_video[:, :, update_start:update_end, :, :] = chunk_video_uint8[:, :, chunk_overlap:, :, :]
 
         # Concatenate all chunks along time dimension
         final_video = torch.cat(generated_chunks, dim=2)

@@ -208,3 +208,5 @@ cython_debug/
 !assets/**/*.mp4
 
 .idea/
+
+data/

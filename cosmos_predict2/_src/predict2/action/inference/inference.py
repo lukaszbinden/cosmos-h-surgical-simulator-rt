@@ -307,9 +307,18 @@ def main():
             continue
 
         for i in range(args.start_frame_idx, len(actions), args.chunk_size):
+            action_chunk = actions[i : i + args.chunk_size]
+            # Skip incomplete chunks - the model requires exactly chunk_size actions
+            # that are divisible by the temporal compression ratio (typically 4)
+            if len(action_chunk) < args.chunk_size:
+                logger.warning(
+                    f"Skipping incomplete action chunk at index {i}: got {len(action_chunk)} actions, "
+                    f"expected {args.chunk_size}"
+                )
+                break
             next_img_array, video_clamped = video2world_cli.step_inference(
                 img_array=img_array,
-                action=actions[i : i + args.chunk_size],
+                action=action_chunk,
                 guidance=args.guidance,
                 seed=i,
             )
