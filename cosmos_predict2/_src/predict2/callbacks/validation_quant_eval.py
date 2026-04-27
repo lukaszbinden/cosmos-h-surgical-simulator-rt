@@ -182,13 +182,49 @@ class EveryNValidationQuantEval(EveryN):
 
         config_job = self.config.job
         # Trainer writes wandb_id.txt at its on_train_start (wandb_util._write_wandb_id);
-        # we read the same path.
+        # we read the same path.  config_job.path_local is already a real host path
+        # on lustre (it's used by the trainer for FSDP DCP saves), so this works
+        # both inside and outside the container thanks to the
+        # ``/lustre/.../lzbinden:/lustre/.../lzbinden`` bind mount.
         self._wandb_id_file = os.path.join(config_job.path_local, "wandb_id.txt")
         self._checkpoint_root = os.path.join(config_job.path_local, "checkpoints")
-        self._validation_root_host = os.path.join(self.repo_root_in_container, self.validation_subdir)
-        self._template_path = os.path.join(self.repo_root_in_container, _TEMPLATE_REL)
-        self._metrics_history_csv = os.path.join(self._validation_root_host, "metrics_history.csv")
+
+        # ------------------------------------------------------------------
+        # Resolve the *host* (true filesystem) path to the repo root.  The
+        # train script exports CODE_PATH for exactly this purpose.  We need
+        # the host path because:
+        #   - SLURM's ``--output=`` / ``--error=`` directives are interpreted
+        #     by slurmd on the host; an in-container ``/workspace/...`` path
+        #     fails to open and the submitted job dies before producing any
+        #     log file (this was the root cause of the silent failure of
+        #     job 9420384 from the first iter_1000 drop).
+        #   - The validation queue dir / metrics CSV / per-iter output dir
+        #     all live on lustre.  Because the ``/lustre/.../lzbinden`` mount
+        #     mirrors the host path inside the container, host paths also work
+        #     transparently when the worker reads them later.
+        # ``/workspace`` (the in-container alias) is only used for things that
+        # are *only* ever resolved inside the container -- the sbatch template
+        # location and the worker's ``cd`` target inside its bash wrapper.
+        # ------------------------------------------------------------------
+        repo_root_host = os.environ.get("CODE_PATH", "").strip()
+        if not repo_root_host:
+            log.warning(
+                f"[{self.name}] CODE_PATH env var is not set.  Falling back to "
+                f"the in-container repo path ({self.repo_root_in_container}) for SLURM "
+                f"--output/--error directives -- this WILL fail to write log files on "
+                f"clusters where slurmd interprets the path on the host (most cases). "
+                f"Set CODE_PATH=<host repo path> in your launcher to fix this."
+            )
+            repo_root_host = self.repo_root_in_container
+        self._repo_root_host = repo_root_host
+
+        self._validation_root_host = os.path.join(repo_root_host, self.validation_subdir)
         self._sbatch_queue_dir = os.path.join(self._validation_root_host, "_sbatch")
+        self._metrics_history_csv = os.path.join(self._validation_root_host, "metrics_history.csv")
+
+        # The template file is read in-process by this callback running inside
+        # the trainer container, so the in-container path is fine here.
+        self._template_path = os.path.join(self.repo_root_in_container, _TEMPLATE_REL)
 
         os.makedirs(self._validation_root_host, exist_ok=True)
         os.makedirs(self._sbatch_queue_dir, exist_ok=True)
@@ -351,26 +387,13 @@ class EveryNValidationQuantEval(EveryN):
         Mounts are intentionally narrow: only the repo (as /workspace) and
         the broad ``healthcareeng_holoscan`` project mount (which covers
         ``Open-H-lz``, ``Open-H_failures_ood``, the SAM3 checkpoint, and the
-        training output dir).
-        """
-        # CODE_PATH on the host — derive from the repo path that resolves to /workspace.
-        # Inside the container the trainer's $PWD is /workspace; on the SLURM submit host
-        # we need the host-side absolute path.  We read it from job.path_local's prefix
-        # heuristically, but the cleanest source is the trainer's cwd pre-mount.
-        # We instead encode the host path via an env var set by the train_scripts/01_train_teacher.sh script.
-        code_path_host = os.environ.get(
-            "CODE_PATH",
-            # Fallback: assume callback runs in the same container as the trainer; the
-            # repo is mounted at /workspace and we need the host path. The Cosmos-H-Surgical
-            # team's standard layout puts code under
-            # /lustre/fsw/portfolios/healthcareeng/users/lzbinden/git/<repo_name>.  The
-            # train_scripts/01_train_teacher.sh script exports CODE_PATH for us, so this
-            # fallback is only for ad-hoc runs.
-            "/lustre/fsw/portfolios/healthcareeng/users/lzbinden/git/cosmos-h-surgical-simulator-rt",
-        )
+        training output dir), plus the user's lustre home for cache / output.
 
+        Uses the host repo path resolved at ``on_train_start`` (CODE_PATH env
+        var; see fallback warning there).
+        """
         mounts = [
-            f"{code_path_host}:{self.repo_root_in_container}",
+            f"{self._repo_root_host}:{self.repo_root_in_container}",
             "/lustre/fsw/portfolios/healthcareeng/projects/healthcareeng_holoscan:"
             "/lustre/fsw/portfolios/healthcareeng/projects/healthcareeng_holoscan",
             "/lustre/fsw/portfolios/healthcareeng/users/lzbinden:"
