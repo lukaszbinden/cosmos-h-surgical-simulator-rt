@@ -858,8 +858,9 @@ OPEN_H_EMBODIMENT_TAGS: frozenset[str] = frozenset(
 # =============================================================================
 
 # ``hf_suturebot`` lives on the original ``Open-H`` lustre mount (fsw).
+_OPEN_H_LZ_BASE = "/lustre/fsw/portfolios/healthcareeng/projects/healthcareeng_holoscan/datasets/Open-H-lz"
 _JHU_DVRK_MONO_OPEN_H_BASE = (
-    f"{_OPEN_H_BASE}/Surgical/JHU/Imerse/previously_collected_data"
+    f"{_OPEN_H_LZ_BASE}/Surgical/JHU/Imerse/previously_collected_data"
 )
 # The 8 newly-converted failure / OOD subsets live on a separate lustre mount
 # (fs11) alongside ``Open-H_failures_ood``; do NOT reuse ``_OPEN_H_BASE``.
