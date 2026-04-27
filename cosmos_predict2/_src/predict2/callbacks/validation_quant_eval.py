@@ -7,25 +7,40 @@
 #
 # http://www.apache.org/licenses/LICENSE-2.0
 
-"""In-training validation quality gate / hook (Option C: async sbatch).
+"""In-training validation quality gate / hook (drop-and-watch sbatch pattern).
 
-Every ``every_n`` training steps, this callback submits a SLURM job (via
-``sbatch``) that runs the full surgical-sim quant evaluation
+Every ``every_n`` training steps, this callback writes a fully-rendered
+``.ready.sbatch`` file into ``<repo_root>/validation/_sbatch/`` describing a
+SLURM job that runs the full surgical-sim quant evaluation
 (FDS + GATC + TCD + a small OOD scenario set) against the latest DCP
-checkpoint, then posts results to the same WandB run as the trainer plus a
-local snapshot under ``<repo_root>/validation/iter_<iter>/``.
+checkpoint and posts results back to the same WandB run as the trainer.
 
-Training itself is never blocked: the callback fires-and-forgets.  If
-sbatch is unavailable or queue submission fails, a warning is logged and
-training continues unaffected.
+The callback itself does NOT call ``sbatch`` --- pyxis containers do not
+have the SLURM client tools on PATH and the SLURM config socket is not
+mounted, so an in-container ``sbatch`` invocation always fails.  Instead a
+small login-node-side watcher (``scripts/validation_sbatch_watcher.sh``)
+polls the queue directory and submits any ``*.ready.sbatch`` files it
+finds, renaming them to ``*.submitted.<jobid>.sbatch`` on success or
+``*.failed.sbatch`` on error.  Run that watcher in a tmux window on the
+login node alongside training, e.g.::
+
+    ./scripts/validation_sbatch_watcher.sh \\
+        /lustre/.../cosmos-h-surgical-simulator-rt/validation/_sbatch/
+
+Training itself is never blocked: the callback writes the file atomically
+(via tmp-then-rename) and returns immediately.  If anything fails on the
+trainer side, a warning is logged and training continues unaffected.
 
 Layout produced (per validation):
 
     <repo_root>/validation/
-    ├── metrics_history.csv           # one row per validation, all iters
+    ├── _sbatch/                                  # queue dir watched by the helper
+    │   ├── iter_<iter>.ready.sbatch              # written by callback, picked up by watcher
+    │   └── iter_<iter>.submitted.<jobid>.sbatch  # renamed by watcher after sbatch success
+    ├── metrics_history.csv                       # one row per validation, all iters
     └── iter_<iter>/
-        ├── metrics.json              # aggregated FDS / GATC / TCD
-        ├── quant_eval_results.json   # full per-episode breakdown
+        ├── metrics.json                          # aggregated FDS / GATC / TCD
+        ├── quant_eval_results.json               # full per-episode breakdown
         ├── worker.log
         ├── comparison/<dataset>/ep<id>_seed<s>.mp4
         └── ood/<dataset>/ood_scenarios/episode_<id>/{13_depth_push_into,14_depth_pull_away}.mp4
@@ -35,7 +50,6 @@ from __future__ import annotations
 
 import os
 import shlex
-import subprocess
 from pathlib import Path
 from typing import List, Optional
 
@@ -53,9 +67,15 @@ _TEMPLATE_REL = "train_scripts/_validation_quant_eval_sbatch.sh.template"
 
 
 class EveryNValidationQuantEval(EveryN):
-    """Async validation quant-eval callback.
+    """Async validation quant-eval callback (drop-and-watch sbatch).
 
-    Submits an sbatch job at every ``every_n`` iterations that:
+    At every ``every_n`` iterations, on rank 0 only, this callback writes a
+    fully rendered ``iter_<iter>.ready.sbatch`` file into the queue dir
+    ``<repo_root>/validation/_sbatch/``.  A login-node-side watcher script
+    (``scripts/validation_sbatch_watcher.sh``) picks up such files and
+    submits them to SLURM; the trainer never calls ``sbatch`` directly.
+
+    The submitted job:
       1. Converts the latest DCP checkpoint to a single ``.pt``.
       2. Runs FDS + GATC + TCD on a small validation subset (3 datasets x
          2 episodes x 2 seeds by default).
@@ -65,7 +85,7 @@ class EveryNValidationQuantEval(EveryN):
          metrics + a couple of comparison + OOD videos.
       5. Persists everything under ``<repo_root>/validation/iter_<iter>/``.
 
-    All file-system / sbatch operations happen on rank 0 only.
+    All file-system operations happen on rank 0 only.
 
     Args:
         every_n: Frequency (in iterations) at which to submit a validation
@@ -168,13 +188,24 @@ class EveryNValidationQuantEval(EveryN):
         self._validation_root_host = os.path.join(self.repo_root_in_container, self.validation_subdir)
         self._template_path = os.path.join(self.repo_root_in_container, _TEMPLATE_REL)
         self._metrics_history_csv = os.path.join(self._validation_root_host, "metrics_history.csv")
+        self._sbatch_queue_dir = os.path.join(self._validation_root_host, "_sbatch")
 
         os.makedirs(self._validation_root_host, exist_ok=True)
+        os.makedirs(self._sbatch_queue_dir, exist_ok=True)
+
         log.info(
             f"[{self.name}] every_n={self.every_n}  "
             f"validation_root={self._validation_root_host}  "
             f"wandb_id_file={self._wandb_id_file}  "
             f"sam3={self.sam3_checkpoint}"
+        )
+        # Big banner so the operator notices the dependency on the watcher
+        log.critical(
+            f"[{self.name}] sbatch QUEUE DIR: {self._sbatch_queue_dir}\n"
+            f"  -> Run 'scripts/validation_sbatch_watcher.sh {self._sbatch_queue_dir}' "
+            f"on the login node to actually submit jobs.\n"
+            f"  -> Without the watcher, .ready.sbatch files accumulate but are never submitted "
+            f"(training is unaffected)."
         )
 
         # Sanity check: the sbatch template file must exist
@@ -182,16 +213,6 @@ class EveryNValidationQuantEval(EveryN):
             log.warning(
                 f"[{self.name}] sbatch template not found at {self._template_path}; "
                 f"the callback will be a no-op."
-            )
-
-        # Sanity check: sbatch must be available somewhere on PATH
-        try:
-            subprocess.run(["sbatch", "--version"], capture_output=True, check=True, timeout=5)
-            log.info(f"[{self.name}] sbatch available; job submission enabled.")
-        except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as e:
-            log.warning(
-                f"[{self.name}] 'sbatch' is unavailable inside the container ({type(e).__name__}). "
-                f"Validation jobs will be skipped (training is unaffected)."
             )
 
     # ------------------------------------------------------------------
@@ -223,10 +244,12 @@ class EveryNValidationQuantEval(EveryN):
             return
 
         validation_dir = os.path.join(self._validation_root_host, f"iter_{iteration:09d}")
-        sbatch_dir = os.path.join(self._validation_root_host, "_sbatch")
-        os.makedirs(sbatch_dir, exist_ok=True)
-        log_file = os.path.join(sbatch_dir, f"iter_{iteration:09d}.log")
-        sbatch_file = os.path.join(sbatch_dir, f"iter_{iteration:09d}.sbatch")
+        log_file = os.path.join(self._sbatch_queue_dir, f"iter_{iteration:09d}.log")
+
+        # Use a hidden tmp filename inside the queue dir, then atomically rename
+        # to ``iter_<iter>.ready.sbatch`` so the watcher never sees a half-written file.
+        sbatch_tmp = os.path.join(self._sbatch_queue_dir, f".iter_{iteration:09d}.partial")
+        sbatch_ready = os.path.join(self._sbatch_queue_dir, f"iter_{iteration:09d}.ready.sbatch")
 
         worker_args = self._build_worker_args(
             iteration=iteration,
@@ -254,38 +277,31 @@ class EveryNValidationQuantEval(EveryN):
         )
 
         try:
-            Path(sbatch_file).write_text(filled)
+            Path(sbatch_tmp).write_text(filled)
+            os.replace(sbatch_tmp, sbatch_ready)  # atomic on POSIX
         except OSError as exc:
-            log.warning(f"[{self.name}] cannot write sbatch file {sbatch_file}: {exc}")
+            log.warning(f"[{self.name}] cannot stage sbatch file {sbatch_ready}: {exc}")
+            # Best-effort cleanup of the partial file
+            try:
+                os.unlink(sbatch_tmp)
+            except OSError:
+                pass
             return
 
-        try:
-            res = subprocess.run(
-                ["sbatch", sbatch_file],
-                capture_output=True,
-                text=True,
-                check=True,
-                timeout=30,
-            )
-        except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as exc:
-            err = getattr(exc, "stderr", str(exc))
-            log.warning(
-                f"[{self.name}] iter={iteration}: sbatch submission failed ({type(exc).__name__}): {err}. "
-                f"Training continues."
-            )
-            return
+        log.info(
+            f"[{self.name}] iter={iteration}: dropped {sbatch_ready}  "
+            f"(login-node watcher will sbatch it)."
+        )
 
-        # Capture the submitted job id (sbatch prints "Submitted batch job <ID>")
-        out = (res.stdout or "").strip()
-        log.info(f"[{self.name}] iter={iteration}: {out}  (sbatch={sbatch_file})")
-
-        # Best-effort: record the submission in WandB so we can correlate
-        # validation runs with the training run timeline.
+        # Best-effort: record the drop in WandB so we can correlate validation
+        # runs with the training run timeline.  The watcher will record the
+        # actual submission a few seconds/minutes later, but this annotation
+        # already lets us see "validation requested at step N" on the loss curve.
         try:
             if wandb.run is not None:
                 wandb.log(
                     {
-                        "val/jobs/submitted": 1.0,
+                        "val/jobs/dropped": 1.0,
                         "val/jobs/last_iter": iteration,
                     },
                     step=iteration,

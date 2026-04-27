@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# SBATCH template for the in-training validation quant-eval worker.
+#
+# Submitted asynchronously by ``EveryNValidationQuantEval`` (see
+# cosmos_predict2/_src/predict2/callbacks/validation_quant_eval.py).
+# Placeholders in the form @@NAME@@ are filled in by the callback before
+# submission.  Do NOT submit this file directly; it is a template.
+#
+# Required substitutions (callback fills these in):
+#   @@JOB_NAME@@               e.g. cp2.5-val-iter02000
+#   @@LOG_FILE@@               absolute path to the per-iter sbatch log
+#   @@PARTITION@@              SLURM partition (e.g. batch_block1)
+#   @@ACCOUNT@@                SLURM account (e.g. healthcareeng_holoscan)
+#   @@TIME@@                   walltime, e.g. 02:00:00
+#   @@CONTAINER_IMAGE@@        absolute path to .sqsh
+#   @@CONTAINER_MOUNTS@@       comma-separated mounts (CODE_PATH:/workspace,...)
+#   @@CODE_PATH@@              host path to repo (mounted at /workspace)
+#   @@WORKER_ARGS@@            single-line list of --flag value args for the worker
+
+#SBATCH --job-name=@@JOB_NAME@@
+#SBATCH --output=@@LOG_FILE@@
+#SBATCH --error=@@LOG_FILE@@
+#SBATCH --partition=@@PARTITION@@
+#SBATCH --account=@@ACCOUNT@@
+#SBATCH --time=@@TIME@@
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --gres=gpu:1
+#SBATCH --requeue
+
+set -euo pipefail
+echo "[validation-quant-eval] start  $(date -Iseconds)"
+echo "[validation-quant-eval] job=$SLURM_JOB_ID  host=$(hostname)"
+
+srun --export=ALL \
+     --container-image="@@CONTAINER_IMAGE@@" \
+     --container-mounts="@@CONTAINER_MOUNTS@@" \
+     --container-workdir=/workspace \
+     bash -c '
+        set -euo pipefail
+        cd /workspace
+        source .venv/bin/activate
+        echo "[validation-quant-eval] worker pid=$$"
+        PYTHONPATH=. python scripts/validation_quant_eval_worker.py @@WORKER_ARGS@@
+        echo "[validation-quant-eval] worker exit=$?"
+     '
+echo "[validation-quant-eval] done   $(date -Iseconds)"
