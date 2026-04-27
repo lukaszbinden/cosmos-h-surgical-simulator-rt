@@ -63,7 +63,6 @@ echo "SLURM Array Task ID: $SLURM_ARRAY_TASK_ID"
 CODE_PATH="/lustre/fsw/portfolios/healthcareeng/users/lzbinden/git/cosmos-h-surgical-simulator-rt"
 
 CONTAINER_MOUNTS="$CODE_PATH:/workspace"
-CONTAINER_MOUNTS="${CONTAINER_MOUNTS},/lustre/fsw/portfolios/healthcareeng/projects/healthcareeng_holoscan/datasets/Open-H_failures_ood:/lustre/fsw/portfolios/healthcareeng/projects/healthcareeng_holoscan/datasets/Open-H_failures_ood"
 CONTAINER_MOUNTS="${CONTAINER_MOUNTS},/lustre/fsw/portfolios/healthcareeng/users/lzbinden:/lustre/fsw/portfolios/healthcareeng/users/lzbinden"
 CONTAINER_MOUNTS="${CONTAINER_MOUNTS},/lustre/fsw/portfolios/healthcareeng/projects/healthcareeng_holoscan:/lustre/fsw/portfolios/healthcareeng/projects/healthcareeng_holoscan"
 
