@@ -862,10 +862,9 @@ _OPEN_H_LZ_BASE = "/lustre/fsw/portfolios/healthcareeng/projects/healthcareeng_h
 _JHU_DVRK_MONO_OPEN_H_BASE = (
     f"{_OPEN_H_LZ_BASE}/Surgical/JHU/Imerse/previously_collected_data"
 )
-# The 8 newly-converted failure / OOD subsets live on a separate lustre mount
-# (fs11) alongside ``Open-H_failures_ood``; do NOT reuse ``_OPEN_H_BASE``.
+# The 8 newly-converted failure / OOD subsets
 _JHU_DVRK_MONO_FAILURES_OOD_BASE = (
-    "/lustre/fs11/portfolios/healthcareeng/projects/healthcareeng_holoscan/"
+    "/lustre/fsw/portfolios/healthcareeng/projects/healthcareeng_holoscan/"
     "datasets/Open-H_failures_ood/Surgical/JHU/Imerse/previously_collected_data"
 )
 
