@@ -603,6 +603,35 @@ class DistributedCheckpointer(AbstractCheckpointer):
 
         if self.callbacks is not None:
             self.callbacks.on_load_checkpoint_end(model, iteration=iteration, checkpoint_path=checkpoint_path)
+
+        # Belt-and-suspenders summary: the log.critical calls above sometimes
+        # get swallowed by the launcher's stdout pipeline (observed when
+        # running under srun --container-image=...).  Use a raw print() with
+        # flush=True from rank 0 so the human running the job ALWAYS sees what
+        # was loaded.
+        if distributed.is_rank0():
+            banner_lines = [
+                "=" * 80,
+                "  CHECKPOINT LOAD SUMMARY (DCP)",
+            ]
+            if checkpoint_path is not None:
+                banner_lines.extend(
+                    [
+                        f"  Path:        {checkpoint_path}",
+                        f"  Keys loaded: {sorted(resume_keys)}",
+                        f"  Iteration:   {iteration}  (next training step: {iteration + 1})",
+                    ]
+                )
+            else:
+                banner_lines.extend(
+                    [
+                        "  No checkpoint loaded — training from scratch.",
+                        f"  load_path config: {self.load_path or '(empty)'}",
+                    ]
+                )
+            banner_lines.append("=" * 80)
+            print("\n" + "\n".join(banner_lines) + "\n", flush=True)
+
         return iteration
 
     def _async_with_pinned_memory(self, checkpoint_file: str, state_dict: Dict[str, Tuple[Any, str]]) -> None:
