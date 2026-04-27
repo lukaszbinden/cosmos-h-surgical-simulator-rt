@@ -1355,12 +1355,37 @@ def evaluate_checkpoint(
     logger.info(f"{'='*80}\n")
 
     phase2_start = time.time()
-    segmenter = SAM3ToolSegmenter(
-        args.sam3_checkpoint,
-        device="cuda",
-        prompt=args.sam3_prompt,
-        score_threshold=args.sam3_score_threshold,
-    )
+    # Phase 2 setup is wrapped so that any failure to bring up SAM3 (missing
+    # sam3_inference on PYTHONPATH, bad checkpoint, missing CUDA, etc.) does
+    # NOT nuke the Phase-1 (FDS) results we already computed.  We bail out of
+    # Phase 2 with a warning and let the caller still aggregate / save / log
+    # whatever it has.
+    try:
+        if not SAM3_AVAILABLE:
+            raise RuntimeError(
+                "sam3_inference is not on PYTHONPATH; "
+                "cannot run Phase 2 (GATC + TCD)."
+            )
+        segmenter = SAM3ToolSegmenter(
+            args.sam3_checkpoint,
+            device="cuda",
+            prompt=args.sam3_prompt,
+            score_threshold=args.sam3_score_threshold,
+        )
+    except Exception as exc:
+        logger.warning(
+            f"Phase 2 (GATC + TCD) skipped after {time.time() - phase2_start:.1f}s — "
+            f"{type(exc).__name__}: {exc}\n"
+            f"Phase 1 (FDS) results are unaffected and will still be aggregated and saved."
+        )
+        # Drop the buffered videos that Phase 2 would otherwise pop, so the
+        # caller's serialiser ``_sanitise`` doesn't have to deal with them
+        # and we don't keep them in RAM until function exit.
+        for entry in episode_results:
+            entry.pop("_gt_video", None)
+            entry.pop("_gen_video", None)
+        torch.cuda.empty_cache()
+        return episode_results
 
     gatc_cfg = GATCConfig(
         k_translation_px=args.gatc_k,
