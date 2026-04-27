@@ -82,14 +82,20 @@ from loguru import logger
 from cosmos_predict2._src.predict2.action.inference.inference_pipeline import (
     ActionVideo2WorldInference,
 )
+# Note: ``load_wrapped_dataset``, ``resolve_timestep_interval`` and
+# ``_lookup_exclude_splits`` live in ``scripts/cosmos_h_surgical_simulator_quant_eval.py``,
+# not in ``inference_open_h``.  ``inference_open_h`` exposes the dataset
+# index helpers / chunk arithmetic only.
 from cosmos_predict2._src.predict2.action.inference.inference_open_h import (
-    load_wrapped_dataset,
-    resolve_timestep_interval,
     build_episode_index_map,
     find_chunk_indices,
     pad_action,
-    _lookup_exclude_splits,
     CHUNK_SIZE,
+)
+from scripts.cosmos_h_surgical_simulator_quant_eval import (
+    _lookup_exclude_splits,
+    load_wrapped_dataset,
+    resolve_timestep_interval,
 )
 from cosmos_predict2._src.predict2.action.datasets.gr00t_dreams.groot_configs import (
     MAX_ACTION_DIM,
