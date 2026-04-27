@@ -22,6 +22,7 @@ from hydra.core.config_store import ConfigStore
 from cosmos_predict2._src.imaginaire.lazy_config import LazyCall as L
 from cosmos_predict2._src.imaginaire.lazy_config import LazyDict
 from cosmos_predict2._src.imaginaire.utils.checkpoint_db import get_checkpoint_path
+from cosmos_predict2._src.predict2.callbacks.validation_quant_eval import EveryNValidationQuantEval
 from cosmos_predict2._src.predict2.datasets.cached_replay_dataloader import (
     duplicate_batches,
     duplicate_batches_random,
@@ -1023,6 +1024,31 @@ AC_CHUNK_SINGLE_VIEW_2B_JHU_DVRK_MONO_FINETUNE_13FRAME_8NODES_OSS = LazyDict(
         optimizer=dict(
             lr=1.6e-4,  # Matches Open-H 8-node recipe (linear scaling from 4-node 8e-5)
             weight_decay=0.1,
+        ),
+        # =============================================================================
+        # In-training validation quality gate (Option C: async sbatch)
+        # =============================================================================
+        # Every 1000 steps, submits a separate SLURM job that:
+        #   (1) converts the latest DCP checkpoint to model_ema_bf16.pt
+        #   (2) runs FDS + GATC + TCD on a small subset of the val mixture
+        #       (hf_suturebot, cosmos_knot_fail_demo, cosmos_fail_filtered)
+        #   (3) generates a depth-only OOD scenario set on hf_suturebot
+        #   (4) posts ``val/...`` metrics + sample mp4s to the same WandB run
+        #   (5) writes <repo_root>/validation/iter_<iter>/ artifacts.
+        #
+        # Training is never blocked: the callback fires-and-forgets via sbatch.
+        # Override the cadence (or any scope param) on the CLI, e.g.::
+        #
+        #     trainer.callbacks.quant_eval.every_n=2000
+        #     trainer.callbacks.quant_eval.num_episodes=1
+        #     trainer.callbacks.quant_eval.ood_episodes=2
+        # =============================================================================
+        trainer=dict(
+            callbacks=dict(
+                quant_eval=L(EveryNValidationQuantEval)(
+                    every_n=1000,
+                ),
+            ),
         ),
     ),
     flags={"allow_objects": True},

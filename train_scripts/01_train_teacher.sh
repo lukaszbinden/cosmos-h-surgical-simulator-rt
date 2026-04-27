@@ -61,6 +61,9 @@ echo "SLURM Array Task ID: $SLURM_ARRAY_TASK_ID"
 
 # Set the necessary variables
 CODE_PATH="/lustre/fsw/portfolios/healthcareeng/users/lzbinden/git/cosmos-h-surgical-simulator-rt"
+# Exported so EveryNValidationQuantEval (validation_quant_eval.py callback)
+# can build the right --container-mounts when it submits its sbatch jobs.
+export CODE_PATH
 
 CONTAINER_MOUNTS="$CODE_PATH:/workspace"
 CONTAINER_MOUNTS="${CONTAINER_MOUNTS},/lustre/fsw/portfolios/healthcareeng/users/lzbinden:/lustre/fsw/portfolios/healthcareeng/users/lzbinden"
