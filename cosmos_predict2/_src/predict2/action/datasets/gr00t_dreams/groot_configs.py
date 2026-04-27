@@ -85,42 +85,23 @@ def _dual_arm_eef_configs(
 
 EMBODIMENT_REGISTRY: dict[str, dict] = {
     # -----------------------------------------------------------------
-    # dVRK JHU (stereo endoscope, 50Hz → stride 5 for 10fps)
+    # dVRK JHU Monocular  (left endoscope only, 30Hz storage → stride 3
+    # for 10fps effective training rate).
+    #
     # Action: REL_XYZ_ROT6D for poses (quat → 9D), ABSOLUTE for grippers
-    # -----------------------------------------------------------------
-    "dvrk": {
-        "timestep_interval": 5,
-        "video_keys": ["video.endoscope_left"],
-        "state_keys": [
-            "state.psm1_pose",
-            "state.psm1_gripper",
-            "state.psm2_pose",
-            "state.psm2_gripper",
-        ],
-        "action_keys": [
-            "action.psm1_pose",
-            "action.psm1_gripper",
-            "action.psm2_pose",
-            "action.psm2_gripper",
-        ],
-        "action_key_configs": _dual_arm_eef_configs(
-            "action.psm1_pose",
-            "action.psm1_gripper",
-            "action.psm2_pose",
-            "action.psm2_gripper",
-            "state.psm1_pose",
-            "state.psm2_pose",
-        ),
-        "video_width": 512,
-        "video_height": 288,
-        "modality_filename": "meta/modality.json",
-        "normalization_mode": "mean_std",
-    },
-    # -----------------------------------------------------------------
-    # dVRK JHU Monocular (left endoscope only, same action space as dvrk)
+    # Raw per-arm channels: xyz(3) + quat_xyzw(4) + gripper(1) = 8D
+    # Post-transform per-arm channels: xyz_rel(3) + rot6d_rel(6) + gripper(1) = 10D
+    # Dual-arm → 20D concatenated action, zero-padded to MAX_ACTION_DIM=44.
+    #
+    # NOTE: this single "jhu_dvrk_mono" entry subsumes the previous
+    # stereo-oriented "dvrk" registry entry. Cosmos is monocular-only
+    # (reads only ``video.endoscope_left``), and the two entries were
+    # byte-identical aside from comments. ``EmbodimentTag.DVRK`` is
+    # preserved in the enum for pickle/checkpoint compatibility but
+    # should be treated as an alias for ``JHU_DVRK_MONO``.
     # -----------------------------------------------------------------
     "jhu_dvrk_mono": {
-        "timestep_interval": 5,
+        "timestep_interval": 3,
         "video_keys": ["video.endoscope_left"],
         "state_keys": [
             "state.psm1_pose",
@@ -808,6 +789,159 @@ OPEN_H_EMBODIMENT_TAGS: frozenset[str] = frozenset(
     }
     | set(EMBODIMENT_REGISTRY.keys())
 )
+
+
+# =============================================================================
+# JHU dVRK Mono Downstream Fine-Tune Mixture (frame-proportional, exp_605-style)
+# =============================================================================
+# Dataset mixture for the downstream fine-tune of the pretrained
+# Cosmos-H-Surgical-Simulator checkpoint on JHU dVRK tabletop data only.
+#
+# All 9 datasets use the unified ``EmbodimentTag.JHU_DVRK_MONO`` embodiment
+# (20D dual-arm EEF + gripper action, post-transform; zero-padded to
+# MAX_ACTION_DIM=44 by MixedLeRobotDataset). Effective training rate is 10 Hz
+# (30 Hz raw storage × timestep_interval=3, set on the registry entry above).
+#
+# Composition:
+#   - ``hf_suturebot``: the original JHU SutureBot LeRobot bundle from the
+#     public Open-H release (1,452 episodes / 516,334 frames).
+#   - 8 newly-converted subsets under ``Open-H_failures_ood``: successful
+#     demos, OOD demos, and failure-case demos converted from the JHU zarr
+#     archives via ``scripts/convert_jhu_zarr_to_lerobot.py``
+#     (1,483 episodes / 557,172 frames across 8 subsets).
+# Total: 2,935 episodes / 1,073,506 frames.
+#
+# Weighting: ``mix_ratio_i = total_frames_i`` per subset, mirroring exp_605's
+# 1× ``jhu_train`` mixture from the prior Cosmos-Surg-dVRK work
+# (cf. ``exp605-nigeln-14_cosmos_predict2/exp605-data-mixture.md``):
+# **each subset contributes proportionally to its number of frames** — no
+# minority oversampling, no size-equalizing.
+#
+# Why frames-proportional instead of equal ``mix_ratio=1.0``: equal weighting
+# would give each of the 9 subsets 1/9 ≈ 11.1% of training samples,
+# upsampling the smallest subset (``suture_bot_success``, 1,557 frames) by
+# >300× to match ``hf_suturebot`` (516,334 frames). That is undesirable here
+# — exp_605 trained with frame-proportional sampling and produced the
+# checkpoints used by the downstream Cosmos-Surg-dVRK pipeline.
+#
+# Train / val split policy (per-spec overrides; Cosmos-predict2.5's trainer
+# barely consumes ``dataloader_val`` in practice — see
+# ``imaginaire/config.py::validation_iter`` default 999_999_999 — so the held-
+# out test data is mostly inert plumbing; we minimize what we give up):
+#
+#     subset                    test_split_ratio  rationale
+#     -----------------------   ----------------  ---------------------------
+#     hf_suturebot              0.01              very large; 1% is plenty
+#     knot_tying                0.01              large; 1% is plenty
+#     cosmos_throw_fail_demo    0.01              medium; 1% is plenty
+#     suture_bot_success        0.02 (default)    tiny; keep symmetric 2%
+#     suture_bot_failure        0.02 (default)
+#     cosmos_fail_filtered      0.02 (default)
+#     cosmos_knot_fail_demo     0.02 (default)
+#     suturebot_act_throw_eval  0.02 (default)
+#     ood                       0.00 (full)       no holdout - all 100% in train
+#
+# Math: ``MixedLeRobotDataset._compute_repeat_factors`` does
+# ``per_sample_weight_i = mix_ratio_i / len(ds_i)``. ``LeRobotSingleDataset``
+# enumerates one base index per frame (every ``(traj_id, base_index)`` pair,
+# see ``dataset.py::_get_all_steps``) and ``WrappedLeRobotSingleDataset``
+# splits ``test_split_ratio`` of those off as the test partition. With
+# ``mix_ratio_i = total_frames_i`` and the per-spec test ratios above, every
+# subset's per_sample_weight in train mode rounds to repeat_factor=1, so no
+# upsampling is applied and each subset contributes its actual frame share.
+# Total drift from "exact frame-proportional" is < 0.2 percentage points
+# (driven entirely by ``ood`` keeping its full 21.42% pool share instead of
+# 21.24%). All other subsets drift down by < 0.08 pp.
+#
+# To re-balance later (e.g., re-introduce exp_606's 2× failure/OOD
+# oversampling), multiply the relevant ``mix_ratio`` by the desired factor.
+# =============================================================================
+
+# ``hf_suturebot`` lives on the original ``Open-H`` lustre mount (fsw).
+_JHU_DVRK_MONO_OPEN_H_BASE = (
+    f"{_OPEN_H_BASE}/Surgical/JHU/Imerse/previously_collected_data"
+)
+# The 8 newly-converted failure / OOD subsets live on a separate lustre mount
+# (fs11) alongside ``Open-H_failures_ood``; do NOT reuse ``_OPEN_H_BASE``.
+_JHU_DVRK_MONO_FAILURES_OOD_BASE = (
+    "/lustre/fs11/portfolios/healthcareeng/projects/healthcareeng_holoscan/"
+    "datasets/Open-H_failures_ood/Surgical/JHU/Imerse/previously_collected_data"
+)
+
+# Per-spec overrides for the 8 non-ood subsets. Frame-count comments measured
+# 2026-04-27 from each subset's ``meta/info.json::total_frames``.
+# Both train and val mixtures share these specs (the val mixture excludes
+# ``ood``, and applies ``data_split="test"`` at the constructor level).
+_JHU_DVRK_MONO_FINETUNE_NON_OOD_SPECS: list[dict] = [
+    # ----- Open-H release bundle (1 dataset) -----
+    {
+        "path": f"{_JHU_DVRK_MONO_OPEN_H_BASE}/hf_suturebot",
+        "embodiment": EmbodimentTag.JHU_DVRK_MONO,
+        "mix_ratio": 516334.0,
+        "test_split_ratio_override": 0.01,
+    },  # 1,452 episodes / 516,334 frames -> 511,171 train / 5,163 val
+    # ----- Open-H_failures_ood bundle (7 datasets, converted from zarr) -----
+    {
+        "path": f"{_JHU_DVRK_MONO_FAILURES_OOD_BASE}/knot_tying",
+        "embodiment": EmbodimentTag.JHU_DVRK_MONO,
+        "mix_ratio": 209253.0,
+        "test_split_ratio_override": 0.01,
+    },  # 512 episodes / 209,253 frames -> 207,161 train / 2,092 val
+    {
+        "path": f"{_JHU_DVRK_MONO_FAILURES_OOD_BASE}/suture_bot_success",
+        "embodiment": EmbodimentTag.JHU_DVRK_MONO,
+        "mix_ratio": 1557.0,
+    },  # 10 episodes / 1,557 frames -> 1,526 train / 31 val (default 2%)
+    {
+        "path": f"{_JHU_DVRK_MONO_FAILURES_OOD_BASE}/suture_bot_failure",
+        "embodiment": EmbodimentTag.JHU_DVRK_MONO,
+        "mix_ratio": 8793.0,
+    },  # 46 episodes / 8,793 frames -> 8,618 train / 175 val (default 2%)
+    {
+        "path": f"{_JHU_DVRK_MONO_FAILURES_OOD_BASE}/cosmos_fail_filtered",
+        "embodiment": EmbodimentTag.JHU_DVRK_MONO,
+        "mix_ratio": 12948.0,
+    },  # 163 episodes / 12,948 frames -> 12,690 train / 258 val (default 2%)
+    {
+        "path": f"{_JHU_DVRK_MONO_FAILURES_OOD_BASE}/cosmos_throw_fail_demo",
+        "embodiment": EmbodimentTag.JHU_DVRK_MONO,
+        "mix_ratio": 54581.0,
+        "test_split_ratio_override": 0.01,
+    },  # 158 episodes / 54,581 frames -> 54,036 train / 545 val
+    {
+        "path": f"{_JHU_DVRK_MONO_FAILURES_OOD_BASE}/cosmos_knot_fail_demo",
+        "embodiment": EmbodimentTag.JHU_DVRK_MONO,
+        "mix_ratio": 30502.0,
+    },  # 151 episodes / 30,502 frames -> 29,892 train / 610 val (default 2%)
+    {
+        "path": f"{_JHU_DVRK_MONO_FAILURES_OOD_BASE}/suturebot_act_throw_eval",
+        "embodiment": EmbodimentTag.JHU_DVRK_MONO,
+        "mix_ratio": 11548.0,
+    },  # 30 episodes / 11,548 frames -> 11,318 train / 230 val (default 2%)
+]
+
+# ``ood`` spec — train-only with a hard ``data_split_override="full"`` so 100%
+# of its 227,990 frames participate in training and zero are held out for the
+# test partition. Pinned in a separate constant so it can be referenced (or
+# removed) explicitly from the train mixture below.
+_JHU_DVRK_MONO_FINETUNE_OOD_SPEC: dict = {
+    "path": f"{_JHU_DVRK_MONO_FAILURES_OOD_BASE}/ood",
+    "embodiment": EmbodimentTag.JHU_DVRK_MONO,
+    "mix_ratio": 227990.0,
+    "data_split_override": "full",
+}  # 413 episodes / 227,990 frames -> 227,990 train / 0 val
+
+# Train mixture: 8 non-ood subsets + ``ood`` (full split, no holdout).
+JHU_DVRK_MONO_FINETUNE_TRAIN_DATASET_SPECS: list[dict] = [
+    *_JHU_DVRK_MONO_FINETUNE_NON_OOD_SPECS,
+    _JHU_DVRK_MONO_FINETUNE_OOD_SPEC,
+]
+
+# Val mixture: 8 non-ood subsets only. ``ood`` is intentionally excluded so its
+# frames are never used as validation. The constructor-level ``data_split="test"``
+# argument applied at instantiation time then selects the trailing test partition
+# per spec (sized by each spec's ``test_split_ratio_override`` or the default).
+JHU_DVRK_MONO_FINETUNE_VAL_DATASET_SPECS: list[dict] = list(_JHU_DVRK_MONO_FINETUNE_NON_OOD_SPECS)
 
 
 def _build_generic_config_and_transforms(

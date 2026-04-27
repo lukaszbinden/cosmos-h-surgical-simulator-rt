@@ -39,7 +39,7 @@ For Cosmos-Predict2.5 updates, see the [upstream changelog](https://github.com/N
 |---|---|---|---|
 | `cmr_versius` | CMR Surgical Versius | **44D** (30D actions + 14D state conditioning) | CMR Surgical |
 | `rob_surgical` | Rob Surgical bitrack | **36D** (4-arm EEF) | Rob Surgical |
-| `dvrk` / `jhu_dvrk_mono` | da Vinci Research Kit | **20D** (dual-arm EEF + gripper) | JHU, JHU LSCR ARCADE |
+| `jhu_dvrk_mono` | JHU da Vinci Research Kit (monocular) | **20D** (dual-arm EEF + gripper) | JHU, JHU LSCR ARCADE |
 | `dvrk_ucb` | dVRK UC Berkeley | **20D** | UC Berkeley |
 | `dvrk_stanford_real` | dVRK Stanford | **20D** (Euler RPY input) | Stanford |
 | `dvrk_ucsd` | dVRK UCSD | **20D** | UCSD |

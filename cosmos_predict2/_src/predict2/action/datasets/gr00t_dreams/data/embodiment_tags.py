@@ -65,7 +65,20 @@ class EmbodimentTag(Enum):
 
     DVRK = "dvrk"
     """
-    The da Vinci Research Kit (dVRK) surgical robot (JHU stereo).
+    DEPRECATED: alias for ``JHU_DVRK_MONO``.
+
+    Historically this tag denoted the stereo-camera variant of the JHU
+    dVRK (da Vinci Research Kit) surgical robot. Cosmos-Predict2.5 is
+    monocular-only (reads only ``video.endoscope_left``), so the stereo
+    and mono registry entries were functionally identical and have been
+    collapsed into a single unified ``EMBODIMENT_REGISTRY["jhu_dvrk_mono"]``
+    spec (see ``groot_configs.py``).
+
+    This enum value is preserved purely for pickle / checkpoint backward
+    compatibility (removing it would break pickled training state that
+    still holds ``EmbodimentTag.DVRK`` instances). New code and dataset
+    specs **must** use ``EmbodimentTag.JHU_DVRK_MONO`` instead.
+
     Dual-arm (PSM1/PSM2) with Cartesian EEF pose + gripper.
     Raw action: psm1_pose(7D) + psm1_gripper(1D) + psm2_pose(7D) + psm2_gripper(1D) = 16D.
     """
@@ -80,9 +93,14 @@ class EmbodimentTag(Enum):
 
     JHU_DVRK_MONO = "jhu_dvrk_mono"
     """
-    Monocular JHU dVRK surgical robot variant.
-    Uses only the left endoscope video stream with the same dual-arm state/action
-    representation as the standard dVRK embodiment.
+    Canonical JHU dVRK (da Vinci Research Kit) surgical robot embodiment tag
+    for Cosmos-Predict2.5. Cosmos is monocular-only, so this uses only the
+    left endoscope video stream. Replaces the deprecated ``DVRK`` tag
+    (which is kept as an alias for pickle compatibility only).
+
+    Dual-arm (PSM1/PSM2) with Cartesian EEF pose + gripper.
+    Raw action: psm1_pose(7D) + psm1_gripper(1D) + psm2_pose(7D) + psm2_gripper(1D) = 16D.
+    Post-transform: xyz_rel(3) + rot6d_rel(6) + gripper(1) per arm × 2 = 20D.
     """
 
     DVRK_UCB = "dvrk_ucb"

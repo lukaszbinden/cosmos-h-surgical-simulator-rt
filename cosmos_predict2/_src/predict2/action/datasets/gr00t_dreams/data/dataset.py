@@ -1539,13 +1539,28 @@ class WrappedLeRobotSingleDataset(LeRobotSingleDataset):
         self,
         *args,
         data_split="full",
+        test_split_ratio: float = 0.05,
         modality_filename: str | None = None,
         exclude_splits: list[str] | None = None,
         **kwargs,
     ):
+        """Wraps ``LeRobotSingleDataset`` with a deterministic train/test split.
+
+        The split is taken from the *trailing* end of ``_all_steps`` so the
+        train portion is contiguous from the start and the test portion is
+        contiguous from the end. ``test_split_ratio`` is the fraction of steps
+        held out for the ``test`` partition; defaults to 0.05 (5 %) to match
+        the historical behaviour of this class. ``data_split="full"`` skips
+        partitioning entirely (every step is used).
+        """
+        if not 0.0 < test_split_ratio < 1.0:
+            raise ValueError(
+                f"test_split_ratio must be in (0, 1), got {test_split_ratio}"
+            )
         # Store data_split BEFORE calling super().__init__() because
         # _get_all_steps_cmr_filtered needs it for cache path generation
         self.data_split = data_split
+        self.test_split_ratio = test_split_ratio
         super().__init__(
             *args,
             modality_filename=modality_filename,
@@ -1556,11 +1571,16 @@ class WrappedLeRobotSingleDataset(LeRobotSingleDataset):
         if data_split == "full":
             pass
         elif data_split == "train":
-            self._all_steps = self._all_steps[: -len(self) // 20]
+            n_test = max(1, int(len(self) * test_split_ratio))
+            self._all_steps = self._all_steps[:-n_test]
         elif data_split == "test":
-            self._all_steps = self._all_steps[-len(self) // 20 :]
+            n_test = max(1, int(len(self) * test_split_ratio))
+            self._all_steps = self._all_steps[-n_test:]
 
-        print(f"Dataset is split into {data_split} data, with {len(self._all_steps)} steps.")
+        print(
+            f"Dataset is split into {data_split} data (test_split_ratio={test_split_ratio:.4f}), "
+            f"with {len(self._all_steps)} steps."
+        )
 
     def _get_trajectories(self) -> tuple[np.ndarray, np.ndarray]:
         """Get the trajectories in the dataset."""
@@ -1812,19 +1832,39 @@ class MixedLeRobotDataset(torch.utils.data.Dataset):
             - ``embodiment`` (str): Embodiment tag string (must be in
               EMBODIMENT_REGISTRY or be one of the built-in embodiments).
             - ``mix_ratio`` (float, optional): Relative sampling weight. Default 1.0.
+            - ``data_split_override`` (str, optional): Per-spec override of the
+              global ``data_split`` argument (one of ``"train"`` / ``"test"`` /
+              ``"full"``). Useful e.g. to keep one subset at 100% in training
+              while the others hold out a test partition. If absent, the global
+              ``data_split`` arg is used.
+            - ``test_split_ratio_override`` (float, optional): Per-spec override
+              of the global ``test_split_ratio``. Useful e.g. to hold out a
+              smaller fraction from a large subset and a larger fraction from
+              a small subset. If absent, the global ``test_split_ratio`` is used.
+            - ``exclude_splits`` (list[str], optional): Episode-level splits
+              from ``meta/info.json`` to exclude (existing key).
         num_frames: Number of video frames per sample (e.g. 13 = 1 context + 12 pred).
-        data_split: One of ``"train"``, ``"test"``, ``"full"``.
+        data_split: One of ``"train"``, ``"test"``, ``"full"``. Applied to every
+            spec unless overridden by ``data_split_override`` on the spec.
         max_action_dim: All action tensors are zero-padded to this dimension.
             Default 44 (CMR Versius conditioning dimension).
         downscaled_res: If True, use 256x256 resolution for all videos.
+        test_split_ratio: Fraction of each sub-dataset's steps held out for the
+            ``test`` partition. Default 0.05 (matches historical behaviour).
+            Overridable per-spec via ``test_split_ratio_override``.
 
     Example::
 
         specs = [
             {"path": "/data/cmr/chole", "embodiment": "cmr_versius", "mix_ratio": 1.0},
-            {"path": "/data/dvrk/suturebot", "embodiment": "dvrk", "mix_ratio": 0.5},
+            {"path": "/data/dvrk/suturebot", "embodiment": "dvrk", "mix_ratio": 0.5,
+             "test_split_ratio_override": 0.01},
+            {"path": "/data/dvrk/ood", "embodiment": "dvrk", "mix_ratio": 1.0,
+             "data_split_override": "full"},  # 100% in train, never in val
         ]
-        dataset = MixedLeRobotDataset(specs, num_frames=13, data_split="train")
+        dataset = MixedLeRobotDataset(
+            specs, num_frames=13, data_split="train", test_split_ratio=0.02
+        )
     """
 
     def __init__(
@@ -1834,6 +1874,7 @@ class MixedLeRobotDataset(torch.utils.data.Dataset):
         data_split: str = "train",
         max_action_dim: int = 44,
         downscaled_res: bool = False,
+        test_split_ratio: float = 0.05,
     ):
         from cosmos_predict2._src.predict2.action.datasets.gr00t_dreams.groot_configs import (
             construct_modality_config_and_transforms,
@@ -1857,7 +1898,14 @@ class MixedLeRobotDataset(torch.utils.data.Dataset):
             embodiment = raw_embodiment.value if isinstance(raw_embodiment, EmbodimentTag) else raw_embodiment
             mix_ratio = spec.get("mix_ratio", 1.0)
 
-            print(f"\n[{i}] Loading: embodiment={embodiment}, mix_ratio={mix_ratio}")
+            # Per-spec overrides (default to the constructor-level values).
+            spec_data_split = spec.get("data_split_override", data_split)
+            spec_test_split_ratio = spec.get("test_split_ratio_override", test_split_ratio)
+
+            print(
+                f"\n[{i}] Loading: embodiment={embodiment}, mix_ratio={mix_ratio}, "
+                f"data_split={spec_data_split}, test_split_ratio={spec_test_split_ratio}"
+            )
             print(f"    path={path}")
 
             config, train_transform, test_transform = construct_modality_config_and_transforms(
@@ -1871,7 +1919,7 @@ class MixedLeRobotDataset(torch.utils.data.Dataset):
             if isinstance(config, dict) and "modality_filename" in config:
                 modality_filename = config.pop("modality_filename")
 
-            transform = train_transform if data_split in ("train", "full") else test_transform
+            transform = train_transform if spec_data_split in ("train", "full") else test_transform
 
             # Per-dataset episode filtering (e.g., exclude "fail", "bad_frames" splits)
             exclude_splits = spec.get("exclude_splits", None)
@@ -1881,7 +1929,8 @@ class MixedLeRobotDataset(torch.utils.data.Dataset):
                 modality_configs=config,
                 transforms=transform,
                 embodiment_tag=embodiment,
-                data_split=data_split,
+                data_split=spec_data_split,
+                test_split_ratio=spec_test_split_ratio,
                 modality_filename=modality_filename,
                 exclude_splits=exclude_splits,
             )

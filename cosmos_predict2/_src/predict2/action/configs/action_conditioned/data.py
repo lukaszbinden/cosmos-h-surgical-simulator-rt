@@ -276,6 +276,8 @@ cmr_versius_256_val_dataloader = L(DataLoader)(
 # ============================================================================
 from cosmos_predict2._src.predict2.action.datasets.gr00t_dreams.data.dataset import MixedLeRobotDataset
 from cosmos_predict2._src.predict2.action.datasets.gr00t_dreams.groot_configs import (
+    JHU_DVRK_MONO_FINETUNE_TRAIN_DATASET_SPECS,
+    JHU_DVRK_MONO_FINETUNE_VAL_DATASET_SPECS,
     MAX_ACTION_DIM,
     OPEN_H_DATASET_SPECS,
 )
@@ -355,6 +357,59 @@ suturebot_train_dataloader = L(DataLoader)(
 suturebot_val_dataloader = L(DataLoader)(
     dataset=suturebot_val_dataset,
     sampler=L(get_sampler)(dataset=suturebot_val_dataset),
+    batch_size=1,
+    drop_last=True,
+)
+
+
+# ============================================================================
+# JHU dVRK Mono Downstream Fine-Tune Dataset Configuration
+# ============================================================================
+# Downstream fine-tune of the pretrained Cosmos-H-Surgical-Simulator (C-H-S-S)
+# checkpoint on the 9 JHU dVRK tabletop datasets (hf_suturebot + 8 newly
+# converted failures/OOD subsets). All 9 subsets use the unified
+# ``EmbodimentTag.JHU_DVRK_MONO`` embodiment; the full mixtures are declared
+# by ``JHU_DVRK_MONO_FINETUNE_{TRAIN,VAL}_DATASET_SPECS`` in ``groot_configs.py``.
+#
+# 20D actions (2x pose(9D) + 2x gripper(1D)) are zero-padded to 44D by
+# ``MixedLeRobotDataset`` to stay compatible with the C-H-S-S model head.
+# Effective training rate: 10 Hz (30 Hz raw × timestep_interval=3).
+#
+# Train mixture: 9 subsets, frame-proportional sampling, ``ood`` at full split
+# (no test holdout). Default ``test_split_ratio=0.02`` is overridden to 0.01
+# on ``hf_suturebot``, ``knot_tying`` and ``cosmos_throw_fail_demo`` (per-spec
+# in groot_configs.py); ``ood`` itself uses ``data_split_override="full"``.
+# Val mixture: 8 subsets (``ood`` excluded). Per-spec ratios are mirrored.
+# ============================================================================
+
+jhu_dvrk_mono_finetune_train_dataset = L(MixedLeRobotDataset)(
+    dataset_specs=JHU_DVRK_MONO_FINETUNE_TRAIN_DATASET_SPECS,
+    num_frames=13,
+    data_split="train",
+    max_action_dim=MAX_ACTION_DIM,
+    downscaled_res=False,
+    test_split_ratio=0.02,  # 2% default; overridable per-spec via test_split_ratio_override
+)
+
+jhu_dvrk_mono_finetune_val_dataset = L(MixedLeRobotDataset)(
+    dataset_specs=JHU_DVRK_MONO_FINETUNE_VAL_DATASET_SPECS,
+    num_frames=13,
+    data_split="test",
+    max_action_dim=MAX_ACTION_DIM,
+    downscaled_res=False,
+    test_split_ratio=0.02,
+)
+
+jhu_dvrk_mono_finetune_train_dataloader = L(DataLoader)(
+    dataset=jhu_dvrk_mono_finetune_train_dataset,
+    sampler=L(get_sampler)(dataset=jhu_dvrk_mono_finetune_train_dataset),
+    batch_size=1,
+    drop_last=True,
+)
+
+jhu_dvrk_mono_finetune_val_dataloader = L(DataLoader)(
+    dataset=jhu_dvrk_mono_finetune_val_dataset,
+    sampler=L(get_sampler)(dataset=jhu_dvrk_mono_finetune_val_dataset),
     batch_size=1,
     drop_last=True,
 )
@@ -467,6 +522,25 @@ def register_training_and_val_data():
         package="dataloader_val",
         name="suturebot_val",
         node=suturebot_val_dataloader,
+    )
+
+    # ============================================================================
+    # JHU dVRK Mono downstream fine-tune mixture
+    # ============================================================================
+    # 9 JHU dVRK tabletop datasets (hf_suturebot + 8 failures/OOD subsets)
+    # under a unified JHU_DVRK_MONO embodiment. Zero-padded to 44D.
+    # ============================================================================
+    cs.store(
+        group="data_train",
+        package="dataloader_train",
+        name="jhu_dvrk_mono_finetune_train",
+        node=jhu_dvrk_mono_finetune_train_dataloader,
+    )
+    cs.store(
+        group="data_val",
+        package="dataloader_val",
+        name="jhu_dvrk_mono_finetune_val",
+        node=jhu_dvrk_mono_finetune_val_dataloader,
     )
 
     # Register gr00t_customized_gr1 data

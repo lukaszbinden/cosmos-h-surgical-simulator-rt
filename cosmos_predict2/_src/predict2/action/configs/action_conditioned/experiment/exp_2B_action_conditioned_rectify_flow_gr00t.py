@@ -952,6 +952,83 @@ AC_CHUNK_SINGLE_VIEW_2B_SUTUREBOT_13FRAME_NODES_OSS = LazyDict(
 )
 
 
+# =============================================================================
+# JHU dVRK Mono downstream fine-tune from Cosmos-H-Surgical-Simulator (Open-H)
+# =============================================================================
+# Downstream fine-tune of the C-H-S-S (Open-H) pre-trained 44D action
+# conditioned checkpoint on the 9 JHU dVRK tabletop datasets (hf_suturebot +
+# 8 failures/OOD subsets from JHU), unified under EmbodimentTag.JHU_DVRK_MONO.
+#
+# JHU dVRK mono 20D actions (2x pose(9D) + 2x gripper(1D)) are zero-padded to
+# 44D by MixedLeRobotDataset, so the action_embedder MLP weights from the
+# C-H-S-S 44D pre-trained checkpoint transfer directly (no re-init needed).
+#
+# Effective training rate is 10 Hz (30 Hz raw × timestep_interval=3). All 9
+# subsets must have a matching `meta/stats_cosmos.json` with the same
+# timestep_interval=3 stamp (computed via scripts/compute_openh_action_stats.py
+# and asserted at load time by ``LeRobotSingleDataset._get_metadata``).
+#
+# Dataset mix: see ``JHU_DVRK_MONO_FINETUNE_DATASET_SPECS`` in
+# ``groot_configs.py``. Default weighting is equal per-subset to avoid
+# drowning the failure/OOD examples under the much larger hf_suturebot bundle.
+#
+# Training resolution is 512x288 (W x H), inherited from
+# ``EMBODIMENT_REGISTRY["jhu_dvrk_mono"]["video_width"/"video_height"]``;
+# all 9 subsets are stored at 960x540 (W x H) and resized at decode time.
+#
+# Follows the C-H-S-S Open-H 8-node recipe (see
+# ``AC_CHUNK_SINGLE_VIEW_2B_OPEN_H_13FRAME_8NODES_OSS`` above): 8 nodes,
+# per-GPU batch_size=16 -> effective batch 8 x 8 x 16 = 1024, lr=1.6e-4.
+# =============================================================================
+AC_CHUNK_SINGLE_VIEW_2B_JHU_DVRK_MONO_FINETUNE_13FRAME_8NODES_OSS = LazyDict(
+    dict(
+        defaults=[
+            "/experiment/2b_bridge_action_conditioned_oss",
+            {"override /net": "cosmos_v1_2B_action_chunk_conditioned"},
+            {"override /data_train": "jhu_dvrk_mono_finetune_train"},
+            {"override /data_val": "jhu_dvrk_mono_finetune_val"},
+            "_self_",
+        ],
+        job=dict(
+            group="official_runs_vid2vid",
+            name="cosmos_predict2p5_2B_action_conditioned_jhu_dvrk_mono_finetune_13frame_8nodes_release_oss",
+            project="cosmos_predict2_action_conditioned",
+        ),
+        # Resume the C-H-S-S Open-H 44D pre-trained checkpoint as the warm start
+        # for this downstream fine-tune. ``strict_resume=False`` and
+        # ``load_training_state=False`` are inherited from the bridge parent, so
+        # mismatched optimizer / iteration state from the source run is
+        # discarded and the action embedder MLP weights load cleanly (44D ==
+        # 44D). Override on the CLI with ``checkpoint.load_path=...`` to
+        # warm-start from a different checkpoint.
+        checkpoint=dict(
+            load_path=(
+                "/lustre/fsw/portfolios/healthcareeng/projects/healthcareeng_holoscan/users/lzbinden/imaginaire/"
+                "output/cosmos_predict2_action_conditioned/official_runs_vid2vid/"
+                "cosmos_predict2p5_2B_action_conditioned_open_h-fixed_13frame_8nodes_release_oss-ts-fix-mlp-fix-30k/"
+                "checkpoints/iter_000012000-v2"
+            ),
+        ),
+        model=dict(
+            config=dict(
+                state_t=1 + 12 // 4,
+                net=dict(
+                    action_dim=44,  # 20D JHU dVRK mono actions zero-padded to 44D (C-H-S-S unified)
+                ),
+            ),
+        ),
+        dataloader_train=dict(
+            batch_size=16,  # Per-GPU batch size at 512x288; 8 nodes x 8 GPUs x 16 = 1024 effective batch
+        ),
+        optimizer=dict(
+            lr=1.6e-4,  # Matches Open-H 8-node recipe (linear scaling from 4-node 8e-5)
+            weight_decay=0.1,
+        ),
+    ),
+    flags={"allow_objects": True},
+)
+
+
 cs = ConfigStore.instance()
 
 for _item, _item_wo_resume, _item_mock_wo_resume in [
@@ -1004,6 +1081,10 @@ for _item, _item_wo_resume, _item_mock_wo_resume in [
     [
         AC_CHUNK_SINGLE_VIEW_2B_SUTUREBOT_13FRAME_NODES_OSS,
         *build_debug_runs(AC_CHUNK_SINGLE_VIEW_2B_SUTUREBOT_13FRAME_NODES_OSS),
+    ],
+    [
+        AC_CHUNK_SINGLE_VIEW_2B_JHU_DVRK_MONO_FINETUNE_13FRAME_8NODES_OSS,
+        *build_debug_runs(AC_CHUNK_SINGLE_VIEW_2B_JHU_DVRK_MONO_FINETUNE_13FRAME_8NODES_OSS),
     ],
 ]:
     cs.store(group="experiment", package="_global_", name=f"{_item['job']['name']}", node=_item)
