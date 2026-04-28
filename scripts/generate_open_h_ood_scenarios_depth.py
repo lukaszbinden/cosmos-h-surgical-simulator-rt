@@ -18,7 +18,8 @@ The OOD trajectories are constructed by:
 - Clustering sampled actions via k-means to find the 3 most frequently occurring
   action patterns, then repeating each 60 times
 
-The 14 OOD scenarios (or 2 with --depth_only):
+The 16 OOD scenarios for dual-arm embodiments (or 4 with --depth_only;
+2 with --depth_only on a single-arm embodiment):
   1)  Both arms left 60x
   2)  Both arms right 60x
   3)  Both arms up 60x
@@ -33,6 +34,8 @@ The 14 OOD scenarios (or 2 with --depth_only):
   12) 3rd most frequent action pattern repeated 60x
   13) Both arms push into tissue (+z depth) 60x
   14) Both arms pull away from tissue (-z depth) 60x
+  15) Left arm push (+z), right arm pull (-z) 60x  -- dual-arm only
+  16) Left arm pull (-z), right arm push (+z) 60x  -- dual-arm only
 
 Output structure:
     <save_root>/<timestamp>/<dataset_name>/
@@ -55,6 +58,8 @@ Output structure:
         ├── 12_frequent_pattern_3.mp4
         ├── 13_depth_push_into.mp4
         ├── 14_depth_pull_away.mp4
+        ├── 15_depth_push_pull.mp4    (dual-arm only)
+        ├── 16_depth_pull_push.mp4    (dual-arm only)
         └── scenarios.json
 
 Usage:
@@ -561,11 +566,19 @@ def _build_depth_scenarios(
     std_action: np.ndarray,
     magnitude: float = 1.0,
 ) -> list[tuple[str, str, np.ndarray]]:
-    """Build two depth OOD trajectories: push into tissue (+z) and pull away (-z).
+    """Build the depth OOD trajectories: same-direction (13/14) and mirrored (15/16).
 
-    Both arms are moved simultaneously along the z (depth) axis for the full
-    trajectory length.  Positive z is defined as *into* the tissue/material,
-    negative z as *away from* it.
+    Scenarios 13 and 14 move BOTH arms simultaneously along the z axis
+    (push into / pull away from tissue) -- a rare but coordinated motion
+    that the dataset rarely contains in pure form.
+
+    Scenarios 15 and 16 move the arms in *opposite* depth directions at
+    the same time (one pushing while the other pulls), which is even more
+    out-of-distribution and is a stronger probe of whether the model has
+    learnt per-arm action conditioning rather than collapsing to a global
+    motion prior.
+
+    Positive z is into the tissue/material, negative z is away from it.
 
     Args:
         arm_layout: Layout dict with ``left_z``, ``right_z``, ``dual``, etc.
@@ -574,30 +587,53 @@ def _build_depth_scenarios(
         magnitude: Perturbation scale in standard-deviation units.
 
     Returns:
-        List of two ``(filename, description, trajectory)`` tuples.
+        List of ``(filename, description, trajectory)`` tuples.  For single-arm
+        embodiments (``arm_layout["dual"] is False``), the mirrored scenarios
+        are silently skipped because there is no second arm to mirror against.
     """
     full = OOD_TRAJECTORY_LENGTH
     lz = arm_layout.get("left_z")
     rz = arm_layout.get("right_z")
     is_dual = arm_layout["dual"]
 
-    def _make_depth_action(dz: float) -> np.ndarray:
+    def _make_depth_action(left_dz: float, right_dz: float) -> np.ndarray:
+        """Depth action with independent per-arm signs.
+
+        ``left_dz`` / ``right_dz`` are in std units.  When the embodiment
+        is single-arm, ``right_dz`` is silently ignored.
+        """
         a = mean_action.copy()
         if lz is not None:
-            a[lz] += dz * magnitude * std_action[lz]
+            a[lz] += left_dz * magnitude * std_action[lz]
         if is_dual and rz is not None:
-            a[rz] += dz * magnitude * std_action[rz]
+            a[rz] += right_dz * magnitude * std_action[rz]
         return a
 
-    return [
+    scenarios: list[tuple[str, str, np.ndarray]] = [
         ("13_depth_push_into",
          f"Both arms push into tissue (+z) {full}x",
-         np.tile(_make_depth_action(+1.0), (full, 1))),
+         np.tile(_make_depth_action(+1.0, +1.0), (full, 1))),
 
         ("14_depth_pull_away",
          f"Both arms pull away from tissue (-z) {full}x",
-         np.tile(_make_depth_action(-1.0), (full, 1))),
+         np.tile(_make_depth_action(-1.0, -1.0), (full, 1))),
     ]
+
+    # Mirrored depth scenarios only apply to dual-arm embodiments.  For single-arm
+    # embodiments these would be identical to 13/14 with the right arm at neutral,
+    # which is not a useful additional probe.
+    if is_dual:
+        scenarios.extend([
+            ("15_depth_push_pull",
+             f"Left arm push (+z), right arm pull (-z) {full}x",
+             np.tile(_make_depth_action(+1.0, -1.0), (full, 1))),
+
+            ("16_depth_pull_push",
+             f"Left arm pull (-z), right arm push (+z) {full}x",
+             np.tile(_make_depth_action(-1.0, +1.0), (full, 1))),
+        ])
+
+    return scenarios
 
 
 # ---------------------------------------------------------------------------
