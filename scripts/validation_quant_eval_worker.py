@@ -157,7 +157,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ood-episodes", type=int, default=1)
     p.add_argument("--ood-depth-only", action="store_true", default=True,
                    help="Generate only the 2 depth scenarios (push/pull) per episode. Default: true.")
-    p.add_argument("--ood-magnitude", type=float, default=1.0)
+    p.add_argument("--ood-magnitude", type=float, default=1.0,
+                   help="In-plane OOD perturbation magnitude in std units (scenarios 1-12).")
+    p.add_argument("--ood-depth-magnitude", type=float, default=2.5,
+                   help=(
+                       "Depth-axis OOD perturbation magnitude in std units (scenarios "
+                       "13-16).  Larger than --ood-magnitude because per-step depth std "
+                       "is small in surgical data and the model strongly resists pull-away "
+                       "commands at 1σ."
+                   ))
     p.add_argument("--ood-stats-episodes", type=int, default=10)
 
     # --- Conversion / model loading ---
@@ -361,6 +369,7 @@ def _run_ood_for_dataset(
     guidance: float,
     save_fps: int,
     ood_magnitude: float,
+    depth_ood_magnitude: float,
     stats_episodes: int,
     depth_only: bool,
 ) -> Tuple[int, List[dict]]:
@@ -441,6 +450,7 @@ def _run_ood_for_dataset(
                 guidance=guidance,
                 save_fps=save_fps,
                 ood_magnitude=ood_magnitude,
+                depth_ood_magnitude=depth_ood_magnitude,
                 depth_only=depth_only,
             )
         except Exception:
@@ -792,6 +802,7 @@ def main() -> int:
                     guidance=args.guidance,
                     save_fps=args.save_fps,
                     ood_magnitude=args.ood_magnitude,
+                    depth_ood_magnitude=args.ood_depth_magnitude,
                     stats_episodes=args.ood_stats_episodes,
                     depth_only=args.ood_depth_only,
                 )

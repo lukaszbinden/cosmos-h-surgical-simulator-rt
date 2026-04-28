@@ -129,35 +129,49 @@ SHORT_TOTAL_FRAMES = SHORT_PRED_FRAMES + 1            # includes initial conditi
 # index 0 = x (horizontal in image plane), index 1 = y (vertical),
 # index 2 = z (depth — positive = into tissue, negative = away).
 #
-# "left" refers to the first arm in concatenation order, "right" the second.
+# Convention: ``left_*`` / ``right_*`` refer to the **camera-frame** perspective
+# (i.e. the arm that visually appears on the left vs right of the rendered
+# video).  This is what users see and what scenario filenames promise.
+#
+# Note that for most LeRobot dual-arm datasets the *first* arm in the action-
+# vector concat order (PSM1 for dVRK family) is conventionally held by the
+# operator's right hand at the console and visually appears on the right of
+# the camera image (because the two PSMs cross during use).  Hence the indices
+# below intentionally route ``right_*`` to the lower indices and ``left_*`` to
+# the higher indices for those embodiments.  When in doubt, eyeball scenario
+# ``07_left_up_right_down.mp4`` for the embodiment: visual-left tool should go
+# up, visual-right should go down.
+#
 # Single-arm embodiments have right_* = None and dual = False.
 # None entry means the layout must be auto-detected at runtime (joint-space).
 # ---------------------------------------------------------------------------
 
 ARM_LAYOUTS: dict[str, dict | None] = {
-    # --- Dual-arm with grippers: [pose(9)+grip(1)] × 2 = 20D ---
-    "dvrk":               {"left_x": 0, "left_y": 1, "left_z": 2, "right_x": 10, "right_y": 11, "right_z": 12, "dual": True},
-    "jhu_dvrk_mono":      {"left_x": 0, "left_y": 1, "left_z": 2, "right_x": 10, "right_y": 11, "right_z": 12, "dual": True},
-    "dvrk_ucb":           {"left_x": 0, "left_y": 1, "left_z": 2, "right_x": 10, "right_y": 11, "right_z": 12, "dual": True},
-    "dvrk_obuda":         {"left_x": 0, "left_y": 1, "left_z": 2, "right_x": 10, "right_y": 11, "right_z": 12, "dual": True},
-    "dvrk_stanford_real": {"left_x": 0, "left_y": 1, "left_z": 2, "right_x": 10, "right_y": 11, "right_z": 12, "dual": True},
-    "jhu_lscr_miracle":   {"left_x": 0, "left_y": 1, "left_z": 2, "right_x": 10, "right_y": 11, "right_z": 12, "dual": True},
-    "jhu_lscr_smarts":    {"left_x": 0, "left_y": 1, "left_z": 2, "right_x": 10, "right_y": 11, "right_z": 12, "dual": True},
-    "hamlyn_30hz":        {"left_x": 0, "left_y": 1, "left_z": 2, "right_x": 10, "right_y": 11, "right_z": 12, "dual": True},
-    "dvrk_ucsd":          {"left_x": 0, "left_y": 1, "left_z": 2, "right_x": 10, "right_y": 11, "right_z": 12, "dual": True},
-    # --- Dual-arm pose only (no grippers): [pose(9)] × 2 = 18D ---
-    "turin_mitic_ex_vivo": {"left_x": 0, "left_y": 1, "left_z": 2, "right_x": 9, "right_y": 10, "right_z": 11, "dual": True},
-    # --- 4-arm pose only: [pose(9)] × 4 = 36D; primary two arms ---
-    "rob_surgical":       {"left_x": 0, "left_y": 1, "left_z": 2, "right_x": 9, "right_y": 10, "right_z": 11, "dual": True},
+    # --- Dual-arm with grippers: [pose(9)+grip(1)] × 2 = 20D, PSM1 first ---
+    # PSM1 (indices 0-9) appears on the camera-RIGHT, so ``right_*`` -> 0-2.
+    "dvrk":               {"left_x": 10, "left_y": 11, "left_z": 12, "right_x": 0,  "right_y": 1,  "right_z": 2,  "dual": True},
+    "jhu_dvrk_mono":      {"left_x": 10, "left_y": 11, "left_z": 12, "right_x": 0,  "right_y": 1,  "right_z": 2,  "dual": True},
+    "dvrk_ucb":           {"left_x": 10, "left_y": 11, "left_z": 12, "right_x": 0,  "right_y": 1,  "right_z": 2,  "dual": True},
+    "dvrk_obuda":         {"left_x": 10, "left_y": 11, "left_z": 12, "right_x": 0,  "right_y": 1,  "right_z": 2,  "dual": True},
+    "dvrk_stanford_real": {"left_x": 10, "left_y": 11, "left_z": 12, "right_x": 0,  "right_y": 1,  "right_z": 2,  "dual": True},
+    "jhu_lscr_miracle":   {"left_x": 10, "left_y": 11, "left_z": 12, "right_x": 0,  "right_y": 1,  "right_z": 2,  "dual": True},
+    "jhu_lscr_smarts":    {"left_x": 10, "left_y": 11, "left_z": 12, "right_x": 0,  "right_y": 1,  "right_z": 2,  "dual": True},
+    "hamlyn_30hz":        {"left_x": 10, "left_y": 11, "left_z": 12, "right_x": 0,  "right_y": 1,  "right_z": 2,  "dual": True},
+    "dvrk_ucsd":          {"left_x": 10, "left_y": 11, "left_z": 12, "right_x": 0,  "right_y": 1,  "right_z": 2,  "dual": True},
+    # --- Dual-arm pose only (no grippers): [pose(9)] × 2 = 18D, PSM1 first ---
+    "turin_mitic_ex_vivo": {"left_x": 9, "left_y": 10, "left_z": 11, "right_x": 0, "right_y": 1, "right_z": 2, "dual": True},
+    # --- 4-arm pose only: [pose(9)] × 4 = 36D; primary two arms, PSM1 first ---
+    "rob_surgical":       {"left_x": 9, "left_y": 10, "left_z": 11, "right_x": 0, "right_y": 1, "right_z": 2, "dual": True},
     # --- Single-arm with gripper: [pose(9)+grip(1)] = 10D ---
     "polyu_sim":          {"left_x": 0, "left_y": 1, "left_z": 2, "right_x": None, "right_y": None, "right_z": None, "dual": False},
     "tud_tundra":         {"left_x": 0, "left_y": 1, "left_z": 2, "right_x": None, "right_y": None, "right_z": None, "dual": False},
     # --- Dual-arm delta xyz: [right_xyz(3)+left_xyz(3)] = 6D (right first!) ---
+    # Already aligned with camera frame: indices 0-2 are the visual-right arm.
     "moon":               {"left_x": 3, "left_y": 4, "left_z": 5, "right_x": 0, "right_y": 1, "right_z": 2, "dual": True},
     # --- Joint-space: auto-detected at runtime ---
     "ustc_torin":         None,
-    # --- CMR Versius: [left_pose(9)+grip(1)+right_pose(9)+grip(1)+...] = 44D ---
-    "cmr_versius":        {"left_x": 0, "left_y": 1, "left_z": 2, "right_x": 10, "right_y": 11, "right_z": 12, "dual": True},
+    # --- CMR Versius: [pose(9)+grip(1)+pose(9)+grip(1)+...] = 44D, first arm visual-right ---
+    "cmr_versius":        {"left_x": 10, "left_y": 11, "left_z": 12, "right_x": 0, "right_y": 1, "right_z": 2, "dual": True},
 }
 
 
@@ -355,6 +369,13 @@ def parse_arguments() -> argparse.Namespace:
     # --- OOD ---
     parser.add_argument("--ood_magnitude", type=float, default=1.0,
                         help="Directional perturbation magnitude in std units (default: 1.0)")
+    parser.add_argument("--depth_ood_magnitude", type=float, default=2.5,
+                        help=(
+                            "Depth-axis (z) perturbation magnitude in std units for "
+                            "scenarios 13-16 (default: 2.5).  Larger than the in-plane "
+                            "default because depth std is small in surgical data and the "
+                            "model strongly resists OOD pull-away commands at 1σ."
+                        ))
     parser.add_argument("--stats_episodes", type=int, default=20,
                         help="Max episodes to sample for action statistics (default: 20)")
     parser.add_argument("--depth_only", action="store_true",
@@ -760,6 +781,7 @@ def run_episode_ood(
     guidance: float,
     save_fps: int,
     ood_magnitude: float,
+    depth_ood_magnitude: float = 2.5,
     depth_only: bool = False,
 ) -> int:
     """Process one episode: save GT video, predicted video, and all OOD scenarios.
@@ -788,8 +810,13 @@ def run_episode_ood(
         seed: Random seed for inference.
         guidance: Classifier-free guidance scale.
         save_fps: FPS for saved videos.
-        ood_magnitude: Perturbation magnitude in std units.
-        depth_only: If True, only generate the two depth (z-axis) OOD
+        ood_magnitude: Perturbation magnitude in std units for scenarios
+            1-12 (in-plane + frequent-action probes).
+        depth_ood_magnitude: Perturbation magnitude in std units for the
+            depth (z-axis) scenarios 13-16.  Defaults to 2.5σ because per-step
+            depth std is small in surgical data and the model strongly
+            resists OOD pull-away commands at 1σ.
+        depth_only: If True, only generate the depth (z-axis) OOD
             scenarios and skip directional + frequent-action scenarios.
 
     Returns:
@@ -898,7 +925,7 @@ def run_episode_ood(
     # 4. OOD scenario videos
     # ------------------------------------------------------------------
     depth_scenarios = _build_depth_scenarios(
-        arm_layout, mean_action, std_action, ood_magnitude,
+        arm_layout, mean_action, std_action, depth_ood_magnitude,
     )
 
     if depth_only:
@@ -990,7 +1017,8 @@ def run_multi_dataset(args: argparse.Namespace, video2world: ActionVideo2WorldIn
     logger.info(f"OOD scenario generation — saving to {run_root}")
     logger.info(
         f"Seed: {args.seed} | Episodes/dataset: {args.episodes_per_dataset} | "
-        f"OOD magnitude: {args.ood_magnitude} | Stats episodes: {args.stats_episodes}"
+        f"OOD magnitude: {args.ood_magnitude} (depth: {args.depth_ood_magnitude}) | "
+        f"Stats episodes: {args.stats_episodes}"
     )
 
     excluded = set(args.exclude_datasets) if args.exclude_datasets else set()
@@ -1002,6 +1030,7 @@ def run_multi_dataset(args: argparse.Namespace, video2world: ActionVideo2WorldIn
         "seed": args.seed,
         "episodes_per_dataset": args.episodes_per_dataset,
         "ood_magnitude": args.ood_magnitude,
+        "depth_ood_magnitude": args.depth_ood_magnitude,
         "stats_episodes": args.stats_episodes,
         "ckpt_path": args.ckpt_path,
         "experiment": args.experiment,
@@ -1120,6 +1149,7 @@ def run_multi_dataset(args: argparse.Namespace, video2world: ActionVideo2WorldIn
                     guidance=args.guidance,
                     save_fps=args.save_fps,
                     ood_magnitude=args.ood_magnitude,
+                    depth_ood_magnitude=args.depth_ood_magnitude,
                     depth_only=args.depth_only,
                 )
             except Exception as e:
