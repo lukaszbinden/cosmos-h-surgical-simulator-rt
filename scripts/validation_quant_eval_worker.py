@@ -488,39 +488,16 @@ def _log_to_wandb(
         logger.warning("wandb not importable; skipping WandB logging.")
         return
 
+    # Minimal headline scalars only.  Per-dataset, per-chunk (early/mid/late),
+    # SSIM, mean (vs. median), coverage and slope variants are still written to
+    # ``metrics.json`` and ``metrics_history.csv`` on disk -- we just don't push
+    # them to WandB to keep the run dashboard scannable.  Less is more.
     info: Dict[str, Any] = {"trainer/global_step": iteration}
-
-    # FDS scalars
     info["val/fds/l1_mean"] = agg.get("l1_mean", float("nan"))
-    info["val/fds/ssim_mean"] = agg.get("ssim_mean", float("nan"))
-    info["val/fds/l1_slope"] = agg.get("l1_slope_mean", float("nan"))
-    for chunk in ("early_c1", "mid_c2c3", "late_c4c6"):
-        info[f"val/fds/l1_{chunk}"] = agg.get(f"l1_{chunk}", float("nan"))
-
-    # GATC
     if "gatc_median" in agg:
         info["val/gatc/median"] = agg["gatc_median"]
-        info["val/gatc/mean"] = agg.get("gatc_mean", float("nan"))
-        info["val/gatc/coverage_pct"] = agg.get("gatc_coverage_mean", float("nan"))
-        for chunk in ("early_c1", "mid_c2c3", "late_c4c6"):
-            info[f"val/gatc/{chunk}_median"] = agg.get(f"gatc_{chunk}_median", float("nan"))
-
-    # TCD
     if "tcd_median" in agg:
         info["val/tcd/median_px"] = agg["tcd_median"]
-        info["val/tcd/mean_px"] = agg.get("tcd_mean", float("nan"))
-        info["val/tcd/coverage_pct"] = agg.get("tcd_coverage_mean", float("nan"))
-        for chunk in ("early_c1", "mid_c2c3", "late_c4c6"):
-            info[f"val/tcd/{chunk}_median_px"] = agg.get(f"tcd_{chunk}_median", float("nan"))
-
-    # Per-dataset breakdown
-    for ds_name, d in agg.get("per_dataset", {}).items():
-        info[f"val/per_dataset/{ds_name}/l1"] = d.get("l1_mean", float("nan"))
-        info[f"val/per_dataset/{ds_name}/ssim"] = d.get("ssim_mean", float("nan"))
-        if "gatc_median" in d:
-            info[f"val/per_dataset/{ds_name}/gatc"] = d["gatc_median"]
-        if "tcd_median" in d:
-            info[f"val/per_dataset/{ds_name}/tcd_px"] = d["tcd_median"]
 
     # Resume the same run as the trainer.
     try:
