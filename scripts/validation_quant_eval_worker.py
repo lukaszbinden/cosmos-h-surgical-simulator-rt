@@ -521,13 +521,30 @@ def _log_to_wandb(
             if mp4s:
                 info[f"val/comparison_videos/{ds_dir.name}"] = wandb.Video(str(mp4s[0]), fps=save_fps, format="mp4")
 
+    # OOD videos.  Layout produced by ``run_episode_ood``:
+    #   <ood_dir>/<dataset>/
+    #     ├── gt/, gt_60pred/, predicted/, predicted_60pred/   (reference clips)
+    #     └── ood_scenarios/episode_<NNNN>/<scenario>.mp4      (the actual OOD rollouts)
+    # Only the ood_scenarios/ subtree is interesting on WandB; the others are
+    # already covered by val/comparison_videos/ for the metric episodes (and
+    # they're saved on disk regardless).  Use a disambiguated key so multiple
+    # scenarios from the same episode/dataset don't collide.
     ood_dir = Path(validation_dir) / "ood"
     if ood_dir.is_dir():
-        # Find any single OOD scenario mp4 to attach as a sanity check
-        mp4s = sorted(ood_dir.rglob("*.mp4"))
-        for mp4 in mp4s[:2]:
-            scenario = mp4.stem
-            info[f"val/ood/{scenario}"] = wandb.Video(str(mp4), fps=save_fps, format="mp4")
+        for mp4 in sorted(ood_dir.rglob("ood_scenarios/episode_*/*.mp4")):
+            ds_name = mp4.parents[2].name        # <dataset>
+            ep_name = mp4.parents[0].name        # episode_<NNNN>
+            scenario = mp4.stem                  # 13_depth_push_into | 14_depth_pull_away | ...
+            key = f"val/ood/{ds_name}/{ep_name}/{scenario}"
+            info[key] = wandb.Video(str(mp4), fps=save_fps, format="mp4")
+        # Also attach the in-distribution model output on the same episode at
+        # the same 60-frame length, so the OOD outputs have a "what does the
+        # model normally do here" reference next to them on the dashboard.
+        for ref in sorted(ood_dir.rglob("predicted_60pred/episode_*.mp4")):
+            ds_name = ref.parents[1].name
+            ep_name = ref.stem                   # episode_<NNNN>
+            key = f"val/ood/{ds_name}/{ep_name}/00_in_distribution_predicted"
+            info[key] = wandb.Video(str(ref), fps=save_fps, format="mp4")
 
     try:
         wandb.log(info, step=iteration)
