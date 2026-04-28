@@ -492,7 +492,7 @@ def _log_to_wandb(
     # SSIM, mean (vs. median), coverage and slope variants are still written to
     # ``metrics.json`` and ``metrics_history.csv`` on disk -- we just don't push
     # them to WandB to keep the run dashboard scannable.  Less is more.
-    info: Dict[str, Any] = {"trainer/global_step": iteration}
+    info: Dict[str, Any] = {}
     info["val/fds/l1_mean"] = agg.get("l1_mean", float("nan"))
     if "gatc_median" in agg:
         info["val/gatc/median"] = agg["gatc_median"]
@@ -510,6 +510,20 @@ def _log_to_wandb(
     except Exception:
         logger.error(f"wandb.init(resume='must') failed for id={wandb_id}:\n{traceback.format_exc()}")
         return
+
+    # Tie val/* scalars to a custom monotonic step axis (``val/iteration``)
+    # instead of wandb's global ``_step``.  Necessary because the worker runs
+    # asynchronously: by the time the iter=N sbatch job actually executes,
+    # the trainer's ``_step`` is already ~N+1k+, so a naive
+    # ``wandb.log(..., step=N)`` is rejected as backwards and the data ends
+    # up only in the run summary, never in the time-series history (==
+    # "no data" panels in the UI).  We don't redefine ``val/loss`` (owned by
+    # the trainer's WandbCallback) -- only the worker's own headline keys.
+    wandb.define_metric("val/iteration", hidden=True)
+    for k in list(info.keys()):
+        if k.startswith("val/") and k != "val/iteration":
+            wandb.define_metric(k, step_metric="val/iteration")
+    info["val/iteration"] = iteration
 
     # Attach a few mp4s (one per dataset, one OOD)
     comparison_dir = Path(validation_dir) / "comparison"
@@ -547,7 +561,12 @@ def _log_to_wandb(
             info[key] = wandb.Video(str(ref), fps=save_fps, format="mp4")
 
     try:
-        wandb.log(info, step=iteration)
+        # NOTE: no step= argument -- val/* scalars use ``val/iteration`` as
+        # their step axis (set via wandb.define_metric above).  wandb's
+        # internal ``_step`` will auto-increment to whatever it is at the
+        # time of write; that's fine since none of our headline metrics
+        # are pinned to it.
+        wandb.log(info)
         logger.info(f"WandB: posted {len(info)} val/* metrics + videos for iter {iteration}")
     finally:
         wandb.finish(quiet=True)
