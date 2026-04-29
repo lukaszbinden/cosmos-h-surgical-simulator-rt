@@ -19,6 +19,7 @@ import functools
 
 from hydra.core.config_store import ConfigStore
 
+from cosmos_predict2._src.imaginaire.functional.lr_scheduler import LambdaWarmUpCosineScheduler
 from cosmos_predict2._src.imaginaire.lazy_config import LazyCall as L
 from cosmos_predict2._src.imaginaire.lazy_config import LazyDict
 from cosmos_predict2._src.imaginaire.utils.checkpoint_db import get_checkpoint_path
@@ -1055,6 +1056,110 @@ AC_CHUNK_SINGLE_VIEW_2B_JHU_DVRK_MONO_FINETUNE_13FRAME_8NODES_OSS = LazyDict(
 )
 
 
+# =============================================================================
+# JHU dVRK mono fine-tune — fine-anneal phase (4 000 steps cosine LR)
+# =============================================================================
+# Continuation experiment that warm-starts from the iter_000016000 DCP of the
+# main JHU dVRK mono fine-tune run and runs a short cosine LR anneal:
+#
+#   schedule (per-step LR multiplier on optimizer.lr):
+#     step 0..100   : linear warm-up  0.10 -> 1.00   (re-settles freshly-zeroed
+#                                                     Adam moments after
+#                                                     load_training_state=False)
+#     step 100..4000: cosine decay    1.00 -> 0.05   (1.6e-4 -> 8e-6)
+#
+# Effective base LR remains ``1.6e-4`` (same as the parent run); the schedule
+# multiplies it.  Final LR at step 4000 is therefore ``8e-6`` (5% of base).
+#
+# Why cosine 1.0 -> 0.05 over 4k:
+#   - The parent run has been training at near-constant LR (the inherited
+#     ``LambdaLinearScheduler`` defaults to ``f_max=f_min=1.0``); validation
+#     metrics plateaued around iter 8k-10k while the model has never seen a
+#     real anneal.  A short fine-anneal lets the optimizer settle into the
+#     basin it has been bouncing around in.
+#   - 4 000 steps is the right horizon for this LR range: the first ~1500
+#     steps are still at >=80% LR (real movement), the last ~1000 at <=10%
+#     (settling).  Below that horizon the cosine doesn't have room to anneal
+#     meaningfully; much above it spends too much compute at near-zero LR.
+#
+# Resume convention (intentional choice):
+#   ``checkpoint.load_path`` points to the ``iter_000016000`` DCP shard
+#   directory, NOT a ``.pt`` file (the DCP loader skips paths ending in ``.pt``;
+#   see ``cosmos_predict2/_src/predict2/checkpointer/dcp.py:493``).  With
+#   ``load_training_state=False`` (inherited from the bridge parent), training
+#   continues from the raw ``net.*`` weights at iter 16k while ``net_ema.*``
+#   continues to track them via the existing EMA decay.  Because the LR is
+#   small for the entire anneal, raw and EMA weights stay close to each other
+#   throughout, and the resulting ``model_ema_bf16.pt`` at iter 4000 is a
+#   slightly more polished version of the iter-16k EMA -- the same outcome
+#   you'd get from a true "resume from EMA" without the DCP-rewrite tooling.
+#
+# Validation-hook artifacts go to ``validation_anneal/`` (not ``validation/``)
+# so the anneal phase does not collide with the parent run's iter_000001000
+# .. iter_000016000 directories.  The validation worker still resumes the
+# trainer's WandB run (which itself is *new* for this experiment because of
+# the distinct ``job.name`` -> distinct ``path_local`` -> distinct
+# ``wandb_id.txt``), so the LR-anneal phase shows up as its own clean WandB
+# run rather than being mixed into the high-LR exploration history.
+# =============================================================================
+AC_CHUNK_SINGLE_VIEW_2B_JHU_DVRK_MONO_FINETUNE_13FRAME_8NODES_OSS_FINE_ANNEAL_4K = LazyDict(
+    dict(
+        defaults=[
+            "/experiment/cosmos_predict2p5_2B_action_conditioned_jhu_dvrk_mono_finetune_13frame_8nodes_release_oss",
+            "_self_",
+        ],
+        job=dict(
+            group="official_runs_vid2vid",
+            name="cosmos_predict2p5_2B_action_conditioned_jhu_dvrk_mono_finetune_13frame_8nodes_release_oss_fine_anneal_4k",
+            project="cosmos_predict2_action_conditioned",
+        ),
+        # Warm-start from the iter-16k DCP of the parent JHU run.  ``load_path``
+        # MUST point at the DCP directory (no trailing ``.pt``); the dcp loader
+        # silently skips paths ending in ``.pt``.
+        checkpoint=dict(
+            load_path=(
+                "/lustre/fsw/portfolios/healthcareeng/projects/healthcareeng_holoscan/users/lzbinden/imaginaire/"
+                "output/cosmos_predict2_action_conditioned/official_runs_vid2vid/"
+                "cosmos_predict2p5_2B_action_conditioned_jhu_dvrk_mono_finetune_13frame_8nodes_release_oss/"
+                "checkpoints/iter_000016000"
+            ),
+            # The bridge parent already sets these, but we make them explicit
+            # here so the resume semantics are obvious from this file alone:
+            #   - load_training_state=False  -> optimizer/scheduler/iter reset
+            #   - strict_resume=False        -> no key-mismatch crash if the
+            #                                   loaded DCP has stale aux keys
+            load_training_state=False,
+            strict_resume=False,
+        ),
+        # Replace the inherited LambdaLinearScheduler (constant 1.0) with an
+        # explicit cosine schedule.  L(...) here fully replaces the class, not
+        # just the field overrides; this is required to switch the math from
+        # linear to cosine.
+        scheduler=L(LambdaWarmUpCosineScheduler)(
+            warm_up_steps=[100],
+            f_start=[0.10],
+            f_max=[1.00],
+            f_min=[0.05],
+            cycle_lengths=[4000],
+        ),
+        trainer=dict(
+            max_iter=4000,
+            callbacks=dict(
+                # Same validation cadence (every 1000 anneal-steps -> 4 evals
+                # at iters 1000/2000/3000/4000), but write to a separate
+                # subdir so we do not overwrite the parent run's
+                # ``validation/iter_000001000`` etc.
+                quant_eval=L(EveryNValidationQuantEval)(
+                    every_n=1000,
+                    validation_subdir="validation_anneal",
+                ),
+            ),
+        ),
+    ),
+    flags={"allow_objects": True},
+)
+
+
 cs = ConfigStore.instance()
 
 for _item, _item_wo_resume, _item_mock_wo_resume in [
@@ -1111,6 +1216,10 @@ for _item, _item_wo_resume, _item_mock_wo_resume in [
     [
         AC_CHUNK_SINGLE_VIEW_2B_JHU_DVRK_MONO_FINETUNE_13FRAME_8NODES_OSS,
         *build_debug_runs(AC_CHUNK_SINGLE_VIEW_2B_JHU_DVRK_MONO_FINETUNE_13FRAME_8NODES_OSS),
+    ],
+    [
+        AC_CHUNK_SINGLE_VIEW_2B_JHU_DVRK_MONO_FINETUNE_13FRAME_8NODES_OSS_FINE_ANNEAL_4K,
+        *build_debug_runs(AC_CHUNK_SINGLE_VIEW_2B_JHU_DVRK_MONO_FINETUNE_13FRAME_8NODES_OSS_FINE_ANNEAL_4K),
     ],
 ]:
     cs.store(group="experiment", package="_global_", name=f"{_item['job']['name']}", node=_item)
