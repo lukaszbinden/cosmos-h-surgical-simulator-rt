@@ -162,13 +162,77 @@ from typing import Optional
 
 import numpy as np
 
+# pynput is the cross-platform key-event capture library used by the live
+# controller.  On headless compute nodes (no X11/Wayland display) pynput's
+# *import-time* backend selection raises ImportError, even when the package
+# itself is installed -- the failure happens deep inside
+# ``pynput/_util/__init__.py::backend()``.
+#
+# We catch that here and substitute a minimal stub for the ``pynput.keyboard``
+# namespace so the rest of this module can still load.  This lets *offline*
+# callers -- which only need the action-construction primitives such as
+# :class:`ControllerGains`, :func:`_arm_binds`, and the index constants --
+# import :mod:`scripts.keyboard.keyboard_controller` without an X server.
+#
+# The :class:`KeyboardController` class itself is unaffected for the live use
+# case: when a real pynput is available the original module loads as before.
+# When the stub is in use, instantiating the controller raises a helpful
+# ImportError (via the stub Listener) so the live use case fails loudly with
+# a clear message rather than silently doing nothing.
 try:
     from pynput import keyboard as pynput_keyboard
-except ImportError as exc:  # pragma: no cover - import guard
-    raise ImportError(
-        "pynput is required for keyboard_controller. Install with:\n"
-        "    pip install pynput"
-    ) from exc
+    _PYNPUT_AVAILABLE = True
+    _PYNPUT_IMPORT_ERROR: Optional[BaseException] = None
+except Exception as _pynput_exc:  # noqa: BLE001 - includes display-backend errors
+    import types as _types
+    _PYNPUT_AVAILABLE = False
+    _PYNPUT_IMPORT_ERROR = _pynput_exc
+
+    # Names referenced from the per-arm keymaps below; values just need to be
+    # distinct, hashable sentinels so the ``_key_to_binds`` dict keeps separate
+    # entries per stubbed key (important if any test code paths walk the dict
+    # without instantiating the controller).
+    _PYNPUT_KEY_NAMES = (
+        "space", "up", "down", "left", "right",
+        "shift", "ctrl", "shift_l", "shift_r", "ctrl_l", "ctrl_r", "esc",
+    )
+
+    class _StubListener:
+        """Stand-in for ``pynput.keyboard.Listener`` when pynput cannot load.
+
+        Raising at instantiation time -- rather than at module import -- is
+        deliberate: it lets the offline imports succeed while still failing
+        loudly the moment a caller tries to spin up live keyboard capture.
+        """
+
+        def __init__(self, *_args, **_kwargs):
+            raise ImportError(
+                "Live KeyboardController needs pynput, but pynput's display-backend "
+                f"selection failed at module load time: {_PYNPUT_IMPORT_ERROR}.  "
+                "Live keyboard control requires an X11/Wayland display; the offline "
+                "action-construction primitives (ControllerGains, _arm_binds, "
+                "DVRK_RAW_DIM, ...) remain importable on headless hosts."
+            )
+
+        # The live controller calls .start()/.stop() on the listener; provide
+        # cheap no-ops so __exit__ paths after a failed start don't raise twice.
+        def start(self) -> None:
+            return None
+
+        def stop(self) -> None:
+            return None
+
+    pynput_keyboard = _types.SimpleNamespace(
+        Key=_types.SimpleNamespace(
+            **{n: f"<pynput.Key.{n}-stub>" for n in _PYNPUT_KEY_NAMES}
+        ),
+        # KeyCode is referenced inside _normalise_key for an isinstance check,
+        # which is only reached on a live listener callback.  An empty class
+        # is sufficient: nothing will ever be an instance of it on a headless
+        # host because no events are produced.
+        KeyCode=type("KeyCodeStub", (), {}),
+        Listener=_StubListener,
+    )
 
 
 # ---------------------------------------------------------------------------
