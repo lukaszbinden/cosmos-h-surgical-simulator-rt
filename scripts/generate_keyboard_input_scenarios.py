@@ -57,10 +57,10 @@ Output structure (one timestamped run per invocation)::
             +-- 01_R_up.mp4
             +-- 02_R_down.mp4
             +-- ...
-            +-- 20_both_walk_grip.mp4
+            +-- 24_R_grip_open_then_close.mp4
             +-- scenarios.json
 
-Standard usage (one invocation, all 20 scenarios per episode)::
+Standard usage (one invocation, all 24 scenarios per episode)::
 
     CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python \\
         scripts/generate_keyboard_input_scenarios.py \\
@@ -210,18 +210,20 @@ class KeyboardScenario:
 
 
 # ---------------------------------------------------------------------------
-# The 20 scenarios (dual-arm-rich; single-arm embodiments are filtered down
+# The 24 scenarios (dual-arm-rich; single-arm embodiments are filtered down
 # automatically -- see ``_filter_scenarios_for_arm_layout``).
 #
-# Numbering is sequential 01-20 and grouped by function:
+# Numbering is sequential 01-24 and grouped by function:
 #   01-04 : single-arm RIGHT translation       (y+, y-, x-, x+)
 #   05-08 : DUAL translation (y-axis)          (both up, R-up_L-down, L-up_R-down, both down)
 #   09-10 : single-arm RIGHT depth             (push, pull)
 #   11-13 : DUAL depth                         (both push, both pull, L-push_R-pull)
 #   14-15 : single-arm RIGHT rotation          (yaw+, pitch+)
-#   16-17 : single-arm + DUAL gripper          (R close, both close)
+#   16-17 : single-arm + DUAL gripper hold     (R close, both close)
 #   18    : sequenced reversal                 (R up -> R down)
 #   19-20 : compound motion + gripper          (R walk-and-grip, dual walk-and-grip)
+#   21-22 : gripper STATE-CHANGE close-then-open (dual, then single-arm)
+#   23-24 : gripper STATE-CHANGE open-then-close (dual, then single-arm)
 #
 # Earlier drafts had isolated LEFT-arm-only sanity checks (#05_L_up, #06_L_down)
 # and a modifier-scaling test (#15_R_up_fast).  They were dropped after the
@@ -229,6 +231,15 @@ class KeyboardScenario:
 # moves the LEFT arm so the isolated tests became redundant, and (b) modifier
 # scaling is a pure controller feature, not a model capability per se -- if
 # 01_R_up works at 1 sigma the model will not fail uniquely at 2 sigma.
+#
+# Scenarios 21-24 were added after first qualitative review revealed that
+# pure close-and-hold gripper scenarios (#16, #17) are invisible when the
+# conditioning frame's gripper is already grasping the needle.  A
+# close-then-open OR open-then-close transition forces the model to render
+# gripper state change *during* the rollout, so the test is informative
+# regardless of start state.  Together #21/#22 (close->open) and #23/#24
+# (open->close) cover both possible initial gripper states and force the
+# model to demonstrate both transition directions on the same checkpoint.
 # ---------------------------------------------------------------------------
 
 DUAL_ARM_SCENARIOS: tuple[KeyboardScenario, ...] = (
@@ -412,6 +423,100 @@ DUAL_ARM_SCENARIOS: tuple[KeyboardScenario, ...] = (
                 held_left=("y_pos", "grip_close"),
                 held_right=("y_pos", "grip_close"),
             ),
+        ),
+    ),
+    # ----- 21-22: gripper STATE-CHANGE probes (close -> open within one rollout)
+    # When the conditioning frame starts with the GT gripper state (typically
+    # already grasping the needle in suturing recordings), a pure close-and-hold
+    # scenario like #16 / #17 is invisible because there's no transition.  These
+    # scenarios force a close-then-open transition during the rollout so the
+    # model has to *demonstrate* gripper state change regardless of start state.
+    KeyboardScenario(
+        filename="21_both_grip_close_then_open",
+        physical_keys="Space + R-Shift (30) -> Z + R-Ctrl (30)",
+        description=(
+            "BOTH arms close gripper for 30 steps, then BOTH arms open "
+            "gripper for 30 steps."
+        ),
+        test=(
+            "DUAL gripper STATE-CHANGE: probes that the model can render an "
+            "open->close->open transition on both grippers within one rollout"
+        ),
+        segments=(
+            KeyboardSegment(
+                held_left=("grip_close",),
+                held_right=("grip_close",),
+                num_steps=30,
+            ),
+            KeyboardSegment(
+                held_left=("grip_open",),
+                held_right=("grip_open",),
+                num_steps=30,
+            ),
+        ),
+    ),
+    KeyboardScenario(
+        filename="22_R_grip_close_then_open",
+        physical_keys="R-Shift (30) -> R-Ctrl (30)",
+        description=(
+            "R-arm closes gripper for 30 steps, then R-arm opens gripper for 30 steps."
+        ),
+        test=(
+            "SINGLE-arm gripper STATE-CHANGE; counterpart of #16 that "
+            "remains visible even when the start-frame gripper is already "
+            "grasping (the open transition is the observable signal)"
+        ),
+        segments=(
+            KeyboardSegment(held_right=("grip_close",), num_steps=30),
+            KeyboardSegment(held_right=("grip_open",), num_steps=30),
+        ),
+    ),
+    # ----- 23-24: gripper STATE-CHANGE in the OPEN-FIRST direction -------
+    # Mirrors #21/#22 with the segments reversed: open-then-close instead of
+    # close-then-open.  Together with #21/#22 this covers both possible
+    # initial gripper states (the conditioning frame's gripper may already
+    # be open OR already be closed depending on the dataset, so one of each
+    # direction is always informative).  The pair (close-then-open,
+    # open-then-close) also forces the model to render *both* transition
+    # directions on the same checkpoint, which the prior pair alone could not.
+    KeyboardScenario(
+        filename="23_both_grip_open_then_close",
+        physical_keys="Z + R-Ctrl (30) -> Space + R-Shift (30)",
+        description=(
+            "BOTH arms open gripper for 30 steps, then BOTH arms close "
+            "gripper for 30 steps."
+        ),
+        test=(
+            "DUAL gripper STATE-CHANGE in the open-first direction; "
+            "complement of #21 -- together they cover both possible initial "
+            "gripper states regardless of conditioning-frame grip state"
+        ),
+        segments=(
+            KeyboardSegment(
+                held_left=("grip_open",),
+                held_right=("grip_open",),
+                num_steps=30,
+            ),
+            KeyboardSegment(
+                held_left=("grip_close",),
+                held_right=("grip_close",),
+                num_steps=30,
+            ),
+        ),
+    ),
+    KeyboardScenario(
+        filename="24_R_grip_open_then_close",
+        physical_keys="R-Ctrl (30) -> R-Shift (30)",
+        description=(
+            "R-arm opens gripper for 30 steps, then R-arm closes gripper for 30 steps."
+        ),
+        test=(
+            "SINGLE-arm gripper STATE-CHANGE in the open-first direction; "
+            "complement of #22"
+        ),
+        segments=(
+            KeyboardSegment(held_right=("grip_open",), num_steps=30),
+            KeyboardSegment(held_right=("grip_close",), num_steps=30),
         ),
     ),
 )
@@ -654,7 +759,7 @@ def _write_readme(
         "    +-- 01_R_up.mp4",
         "    +-- 02_R_down.mp4",
         "    +-- ...",
-        "    +-- 20_both_walk_grip.mp4",
+        "    +-- 24_R_grip_open_then_close.mp4",
         "    +-- scenarios.json               # per-scenario metadata",
         "```",
         "",
@@ -745,8 +850,9 @@ def parse_arguments() -> argparse.Namespace:
         "--scenarios", type=str, nargs="+", default=None,
         help=(
             "Run only the listed scenario filenames (without .mp4), e.g. "
-            "'01_R_up 09_R_push 14_R_yaw_pos 16_R_grip_close 18_R_up_then_down 20_both_walk_grip'.  "
-            "Default: run all 20."
+            "'01_R_up 09_R_push 14_R_yaw_pos 16_R_grip_close 18_R_up_then_down "
+            "20_both_walk_grip 21_both_grip_close_then_open 23_both_grip_open_then_close'.  "
+            "Default: run all 24."
         ),
     )
 
