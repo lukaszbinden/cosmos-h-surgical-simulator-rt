@@ -16,7 +16,11 @@
 from hydra.core.config_store import ConfigStore
 
 from cosmos_predict2._src.imaginaire.lazy_config import LazyDict
-from cosmos_predict2._src.predict2.distill.utils.config_helper import build_no_s3_run, deep_update_config_dict
+from cosmos_predict2._src.predict2.distill.utils.config_helper import (
+    build_no_s3_run,
+    build_no_s3_run_v2,
+    deep_update_config_dict,
+)
 
 
 def make_experiment(
@@ -146,6 +150,46 @@ ACTION_GR00T_WARMUP_G1 = make_experiment(
     ),
 )
 
+# ============================================================================
+# JHU dVRK Mono Warmup (Phase 1 of the SF pipeline for the surgical simulator)
+# ============================================================================
+# Loads the annealed JHU dVRK Mono teacher (iter_000004000 from the 4k cosine
+# fine-anneal phase, see exp_2B_action_conditioned_rectify_flow_gr00t.py) and
+# trains the student on the Phase 0 trajectory cache produced by
+# ``inference_jhu_dvrk_warmup.py`` over the 9-dataset JHU dVRK mixture.
+#
+# Recipe (vs. upstream gr1):
+#   - action_dim = 44   (matches the JHU dVRK teacher's MAX_ACTION_DIM padding)
+#   - resolution = 288  (the teacher trained at 288x512 W,H -- registry value)
+#   - 8 nodes x 8 GPUs x batch_size=8 = effective batch 512 (matches upstream's
+#     16 nodes x bs=4 = 512), so we keep upstream's lr=3e-5 unchanged.
+#   - max_iter = 20000  (per the SF instruction RTF).
+# ============================================================================
+ACTION_JHU_DVRK_MONO_WARMUP = make_experiment(
+    name="jhu_dvrk_mono_i4_lr3e-5",
+    data="jhu_dvrk_mono_warmup",
+    overrides=dict(
+        checkpoint=dict(
+            # Annealed JHU dVRK Mono teacher (DCP shard, NOT a .pt). The DCP
+            # contains both net.* and net_ema.*; load_ema_to_reg in the warmup
+            # model loads net_ema.* into the student's net.*.
+            load_path="/lustre/fsw/portfolios/healthcareeng/projects/healthcareeng_holoscan/users/lzbinden/imaginaire/output/cosmos_predict2_action_conditioned/official_runs_vid2vid/cosmos_predict2p5_2B_action_conditioned_jhu_dvrk_mono_finetune_13frame_8nodes_release_oss_fine_anneal_4k/checkpoints/iter_000004000",
+        ),
+        model=dict(
+            config=dict(
+                net=dict(action_dim=44),
+                resolution="288",  # 288x512 (W,H) per EMBODIMENT_REGISTRY['jhu_dvrk_mono']
+            ),
+        ),
+        # 8 nodes x bs=8 = 512 effective batch ≡ upstream 16 nodes x bs=4
+        # ⇒ same per-sample LR as upstream's tested 3e-5.
+        optimizer=dict(lr=3e-5),
+        dataloader_train=dict(
+            batch_size=8,
+        ),
+    ),
+)
+
 """
 torchrun --nproc_per_node=1 --master_port=12341 -m scripts.train --config=cosmos_predict2/_src/predict2/interactive/configs/config_warmup.py -- experiment=cosmos_predict2p5_2B_action_gr00t_gr1_warmup
 """
@@ -169,4 +213,14 @@ cs.store(
     package="_global_",
     name="cosmos_predict2p5_2B_action_gr00t_gr1_warmup_no_s3",
     node=build_no_s3_run(ACTION_GR00T_WARMUP_GR1),
+)
+# JHU dVRK Mono warmup: resumable variant for SLURM array re-runs (fixed job
+# name across restarts so checkpoints land in / load from the same dir). Uses
+# build_no_s3_run_v2 so the JHU-specific overrides (action_dim=44, batch_size=8,
+# lr=3e-5, load_path, resolution) survive the no-S3 transformation.
+cs.store(
+    group="experiment",
+    package="_global_",
+    name="cosmos_predict2p5_2B_action_jhu_dvrk_mono_warmup_no_s3_resumable",
+    node=build_no_s3_run_v2(ACTION_JHU_DVRK_MONO_WARMUP, local_path=True, resumable=True),
 )
