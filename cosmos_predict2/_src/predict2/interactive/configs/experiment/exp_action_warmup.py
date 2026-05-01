@@ -214,13 +214,38 @@ cs.store(
     name="cosmos_predict2p5_2B_action_gr00t_gr1_warmup_no_s3",
     node=build_no_s3_run(ACTION_GR00T_WARMUP_GR1),
 )
-# JHU dVRK Mono warmup: resumable variant for SLURM array re-runs (fixed job
-# name across restarts so checkpoints land in / load from the same dir). Uses
-# build_no_s3_run_v2 so the JHU-specific overrides (action_dim=44, batch_size=8,
-# lr=3e-5, load_path, resolution) survive the no-S3 transformation.
+# JHU dVRK Mono warmup: resumable variant for SLURM array re-runs.
+# - resumable=True           -> fixed ..._no_s3_resumable job name so path_local
+#                               is stable across re-runs (the trainer's
+#                               latest_checkpoint.txt resume picks up correctly).
+# - load_training_state=False -> on the FIRST cold start, only the teacher's
+#                               `model` weights are loaded -- NOT the teacher's
+#                               optimizer / scheduler / trainer state. The
+#                               teacher's Adam moments encode statistics for a
+#                               different loss landscape (rectified-flow MSE on
+#                               real videos) than our warmup objective (MSE
+#                               between student velocity prediction and cached
+#                               teacher target latents at random query steps).
+#                               Inheriting them mis-scales the adaptive per-
+#                               parameter LR for ~500-1000 iters until Adam
+#                               re-converges (beta_2=0.999 has half-life ~700).
+#                               Iter counter also resets to 0, so max_iter=20000
+#                               (upstream default) gives exactly 20k actual
+#                               warmup iters.
+# - On re-runs after walltime preemption, the trainer's Path-1 resume kicks in
+#   regardless of load_training_state and ALL keys load from path_local --
+#   so re-run resumability is preserved with the correct warmup-objective
+#   optimizer state.
+# Build_no_s3_run_v2 is used so the JHU-specific overrides (action_dim=44,
+# batch_size=8, lr=3e-5, load_path, resolution) survive the no-S3 transformation.
 cs.store(
     group="experiment",
     package="_global_",
     name="cosmos_predict2p5_2B_action_jhu_dvrk_mono_warmup_no_s3_resumable",
-    node=build_no_s3_run_v2(ACTION_JHU_DVRK_MONO_WARMUP, local_path=True, resumable=True),
+    node=build_no_s3_run_v2(
+        ACTION_JHU_DVRK_MONO_WARMUP,
+        local_path=True,
+        resumable=True,
+        load_training_state=False,
+    ),
 )

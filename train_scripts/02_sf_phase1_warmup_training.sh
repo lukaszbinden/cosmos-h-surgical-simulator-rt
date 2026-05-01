@@ -10,9 +10,19 @@
 #
 # Recipe: 8 nodes x 8 GPUs x bs=8 = effective batch 512 (== upstream 16 x 4),
 # lr=3e-5, max_iter=20000, constant LR. See exp_action_warmup.py for details.
+#
+# Container: imaginaire4:v10.1.7.sqsh (NOT cosmos-predict-2.5.sqsh).
+# The warmup model's action_causal_cosmos_v1_2B net uses NATTEN's multi-dim
+# attention backend (cosmos_predict2/_src/imaginaire/attention/backends.py),
+# which is only present in the imaginaire4 image. cosmos-predict-2.5.sqsh
+# crashes at startup with:
+#   ValueError: Could not find a compatible Multi-Dimensional Attention
+#   backend for this use case / device.
+# Mirrors the SF-debug warmup_training.sh setup exactly (container, runtime
+# env, PYTHONPATH packages/ extension, runtime pip install).
 #SBATCH --job-name=sf-jhu-dvrk-warmup
 #SBATCH --nodes=8
-#SBATCH --ntasks-per-node=1
+#SBATCH --ntasks-per-node=8
 #SBATCH --gres=gpu:8
 #SBATCH --account=healthcareeng_holoscan
 ##SBATCH --partition=batch_block1,batch_block3,batch_block4
@@ -51,57 +61,87 @@ else
   echo "[jobId=${SLURM_JOB_ID}] Skipping repo archive (only done on array task 0)"
 fi
 
-# === Distributed training environment ===
-master_addr=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
-export MASTER_ADDR=${master_addr:-"127.0.0.1"}
-export worker_list=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | tr '\n' ' ')
+# === IMAGINAIRE output / cache layout ===
+# We want checkpoints to land in the standard fsw lustre path so they are
+# discoverable by future Phase 2 (03_sf_phase2_sf_training.sh) which loads the
+# warmup output as init weights for the student. Mounted as /imaginaire_output
+# inside the container; IMAGINAIRE_OUTPUT_ROOT then redirects writes there.
+OUTPUT_DIR="/lustre/fsw/portfolios/healthcareeng/users/lzbinden/imaginaire/output"
+CACHE_DIR="/lustre/fsw/portfolios/healthcareeng/users/lzbinden/imaginaire/cache"
+mkdir -p "$OUTPUT_DIR" "$CACHE_DIR"
+echo "[jobId=${SLURM_JOB_ID}] imaginaire_output: ${OUTPUT_DIR}"
+echo "[jobId=${SLURM_JOB_ID}] imaginaire_cache.: ${CACHE_DIR}"
+echo "[jobId=${SLURM_JOB_ID}] Array Task ID....: ${SLURM_ARRAY_TASK_ID}"
 
-nodes=( $(scontrol show hostnames "$SLURM_JOB_NODELIST") )
-nodes_array=("${nodes[@]}")
-head_node="${nodes_array[0]}"
-head_node_ip=$(srun --nodes=1 --ntasks=1 -w "$head_node" hostname --ip-address)
+# Compute distributed training variables (exported to container via --export=ALL)
+export MASTER_PORT=$(expr 10000 + $(echo -n $SLURM_JOB_ID | tail -c 4))
+export WORLD_SIZE=$(($SLURM_NNODES * $SLURM_NTASKS_PER_NODE))
+export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
 
-export LOGLEVEL=INFO
-export NCCL_DEBUG=INFO
-export NCCL_DEBUG_SUBSYS=WARN
-export PYTHONFAULTHANDLER=1
+echo "Nodelist=$SLURM_JOB_NODELIST"
+echo "MASTER_PORT=$MASTER_PORT"
+echo "WORLD_SIZE=$WORLD_SIZE"
+echo "MASTER_ADDR=$MASTER_ADDR"
 
-echo "[jobId=${SLURM_JOB_ID}] MASTER_ADDR=$MASTER_ADDR  Head node IP=$head_node_ip"
-echo "[jobId=${SLURM_JOB_ID}] All nodes:    ${nodes_array[@]}"
-echo "[jobId=${SLURM_JOB_ID}] Array task id: ${SLURM_ARRAY_TASK_ID:-0}"
-
-# === Container & mounts ===
 CODE_PATH="/lustre/fsw/portfolios/healthcareeng/users/lzbinden/git/cosmos-h-surgical-simulator-rt"
-CONTAINER_IMAGE="/lustre/fsw/portfolios/healthcareeng/projects/healthcareeng_holoscan/users/lzbinden/images/cosmos-predict-2.5.sqsh"
+CONTAINER_IMAGE="/lustre/fsw/portfolios/healthcareeng/projects/healthcareeng_holoscan/users/lzbinden/images/imaginaire4:v10.1.7.sqsh"
 
-CONTAINER_MOUNTS="$CODE_PATH:/workspace"
-CONTAINER_MOUNTS="${CONTAINER_MOUNTS},/lustre/fsw/portfolios/healthcareeng/users/lzbinden:/lustre/fsw/portfolios/healthcareeng/users/lzbinden"
+CONTAINER_MOUNTS="${OUTPUT_DIR}:/imaginaire_output"
+CONTAINER_MOUNTS="${CONTAINER_MOUNTS},$CODE_PATH:/workspace"
+CONTAINER_MOUNTS="${CONTAINER_MOUNTS},${CACHE_DIR}:/imaginaire_cache"
 CONTAINER_MOUNTS="${CONTAINER_MOUNTS},/lustre/fsw/portfolios/healthcareeng/projects/healthcareeng_holoscan:/lustre/fsw/portfolios/healthcareeng/projects/healthcareeng_holoscan"
 
-srun --export=ALL --container-image="$CONTAINER_IMAGE" \
+srun --export=ALL \
+     --container-image="$CONTAINER_IMAGE" --container-name=container \
      --container-mounts="$CONTAINER_MOUNTS" \
      --container-workdir=/workspace \
      bash -c '
-        echo "MASTER_ADDR=$MASTER_ADDR"
-        export NCCL_DEBUG=INFO
-        CURRENT_RANK=${SLURM_NODEID:-"0"}
-        n_node=${SLURM_JOB_NUM_NODES:-1}
-        echo "[jobId=$SLURM_JOB_ID] Array=$SLURM_ARRAY_TASK_ID | Worker_list=$worker_list | Node rank=$CURRENT_RANK of $n_node"
+        # === DISTRIBUTED TRAINING SETUP ===
+        export RANK=$SLURM_PROCID
+        export LOCAL_RANK=$SLURM_LOCALID
+        echo "[Rank $RANK / LOCAL_RANK $LOCAL_RANK] MASTER_ADDR=$MASTER_ADDR MASTER_PORT=$MASTER_PORT WORLD_SIZE=$WORLD_SIZE"
 
-        cd /workspace
-        source .venv/bin/activate
+        # === PYTHON SETUP ===
+        # imaginaire4 image: use container Python directly (no .venv activation).
+        # Add fork-internal packages to PYTHONPATH (cosmos_oss, cosmos_cuda, cosmos_gradio).
+        export PANDAS_NO_EXTENSION_ARRAY=True
+        export PYTHONPATH=/workspace:/workspace/packages/cosmos-oss:/workspace/packages/cosmos-cuda:/workspace/packages/cosmos-gradio:${PYTHONPATH:-}
 
-        seed=$((1234 + $SLURM_ARRAY_TASK_ID * $n_node * 8))
+        # Install missing packages on LOCAL_RANK 0 only to avoid race conditions.
+        # python -m pip avoids the broken /root/.local/bin/pip shebang in the container.
+        if [ "$LOCAL_RANK" = "0" ]; then
+            python -m pip install tyro albumentations --quiet
+        fi
+        sleep 10
 
-        # NOTE: unlike 01_train_teacher.sh and 02_train_fine_anneal.sh (which use the
-        # action_conditioned config with a mock IterativeJointDataLoader.dataloaders dict),
-        # the interactive warmup config replaces data_train wholesale with a single
-        # L(DataLoader) (no dataloaders dict). So no ~dataloader_train.dataloaders here
-        # -- matches the SF debug warmup_training.sh pattern.
-        torchrun --nnodes=$n_node --nproc_per_node=8 --master_port=25001 --master_addr $MASTER_ADDR --node_rank=$CURRENT_RANK -m \
-            scripts.train \
-              --config=cosmos_predict2/_src/predict2/interactive/configs/config_warmup.py \
-              -- \
-              experiment="cosmos_predict2p5_2B_action_jhu_dvrk_mono_warmup_no_s3_resumable" \
-              checkpoint.save_iter=200
+        # Sanity check NATTEN is available (the warmup model needs it):
+        if [ "$LOCAL_RANK" = "0" ]; then
+            echo "[Rank $RANK] Python: $(which python)"
+            echo "[Rank $RANK] PYTHONPATH: $PYTHONPATH"
+            python -c "import torch; print(\"[Rank $RANK] CUDA available:\", torch.cuda.is_available(), \"device count:\", torch.cuda.device_count())"
+            python -c "import natten; print(\"[Rank $RANK] NATTEN version:\", natten.__version__)" 2>&1 || echo "[Rank $RANK] NATTEN import failed -- warmup will crash"
+            python -c "import natten; from natten.functional import na2d; print(\"[Rank $RANK] NATTEN na2d available\")" 2>&1 || echo "[Rank $RANK] NATTEN na2d not available"
+        fi
+
+        # === TRAINING ENVIRONMENT ===
+        ulimit -c 0
+        export TORCH_NCCL_ENABLE_MONITORING=0
+        export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=1800
+        export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+        export IMAGINAIRE_OUTPUT_ROOT=/imaginaire_output
+        export IMAGINAIRE_CACHE_DIR=/imaginaire_cache
+        export TORCH_HOME=/imaginaire_cache
+        export WANDB_CACHE_DIR=/imaginaire_cache
+        export WANDB_DATA_DIR=/imaginaire_cache
+        export ENABLE_ONELOGGER=TRUE
+
+        # === RUN TRAINING ===
+        # python -m scripts.train (NOT torchrun): the trainer reads
+        # RANK / LOCAL_RANK / WORLD_SIZE / MASTER_ADDR / MASTER_PORT from env,
+        # which the per-rank srun layout (--ntasks-per-node=8) sets correctly.
+        python -m scripts.train \
+            --config=cosmos_predict2/_src/predict2/interactive/configs/config_warmup.py \
+            -- \
+            experiment=cosmos_predict2p5_2B_action_jhu_dvrk_mono_warmup_no_s3_resumable \
+            checkpoint.save_iter=200
      '

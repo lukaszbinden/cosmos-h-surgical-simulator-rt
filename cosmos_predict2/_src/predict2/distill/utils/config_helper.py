@@ -15,10 +15,31 @@
 from cosmos_predict2._src.imaginaire.utils.checkpoint_db import get_checkpoint_path
 
 
-def build_no_s3_run(job: dict, local_path: bool = False, resumable: bool = False) -> dict:
+def build_no_s3_run(
+    job: dict,
+    local_path: bool = False,
+    resumable: bool = False,
+    load_training_state: bool | None = None,
+) -> dict:
     """
     Make a copy of the input config that doesn't require S3 for checkpointing
     and I/O in the callbacks.
+
+    Args:
+        job: Source experiment dict.
+        local_path: If True, use ``job["checkpoint"]["load_path"]`` verbatim
+            instead of resolving it as an S3 URI.
+        resumable: If True, use a fixed ``..._no_s3_resumable`` job name (so
+            ``path_local`` is stable across SLURM re-runs and the trainer's
+            ``latest_checkpoint.txt`` resume logic kicks in). If False, the
+            job name gets a timestamp suffix.
+        load_training_state: Override the value written into the ``checkpoint``
+            override block. If ``None`` (default), defaults to ``resumable``
+            for backwards compatibility. Set explicitly to decouple the two
+            concepts -- e.g. ``resumable=True, load_training_state=False`` to
+            keep fixed path_local but NOT inherit the teacher checkpoint's
+            optimizer/scheduler/trainer state on the first run (cleaner Adam
+            warmup for objectives that differ from the teacher's loss).
     """
     # If local_path is True, use the local path as the load path
     if local_path:
@@ -35,6 +56,10 @@ def build_no_s3_run(job: dict, local_path: bool = False, resumable: bool = False
     else:
         job_name = f"{job['job']['name']}_no_s3" + "_${now:%Y-%m-%d}_${now:%H-%M-%S}"
 
+    # Default load_training_state to resumable's value (back-compat).
+    if load_training_state is None:
+        load_training_state = resumable
+
     no_s3_run = dict(
         defaults=defaults + ["_self_"] if "_self_" not in defaults else defaults,
         job=dict(
@@ -45,9 +70,15 @@ def build_no_s3_run(job: dict, local_path: bool = False, resumable: bool = False
             save_to_object_store=dict(enabled=False, credentials=""),
             load_from_object_store=dict(enabled=False),
             load_path=load_path,
-            # For resumable runs, load the full training state (optimizer, scheduler, etc.)
-            # when resuming from the latest checkpoint in the same directory.
-            load_training_state=resumable,
+            # On the very first run (no path_local checkpoint yet), this gates
+            # whether the trainer pulls just ``model`` (False) or all four
+            # KEYS_TO_SAVE = model + optim + scheduler + trainer (True) from
+            # the load_path. On subsequent SLURM re-runs the trainer's Path-1
+            # resume logic (cosmos_predict2/_src/predict2/checkpointer/dcp.py
+            # ::keys_to_resume_during_load) ALWAYS loads all four keys from
+            # path_local/latest_checkpoint.txt -- so this flag does NOT affect
+            # re-run behavior, only the first cold start.
+            load_training_state=load_training_state,
         ),
         trainer=dict(
             straggler_detection=dict(enabled=False),
@@ -66,7 +97,12 @@ def build_no_s3_run(job: dict, local_path: bool = False, resumable: bool = False
     return no_s3_run
 
 
-def build_no_s3_run_v2(job: dict, local_path: bool = False, resumable: bool = False) -> dict:
+def build_no_s3_run_v2(
+    job: dict,
+    local_path: bool = False,
+    resumable: bool = False,
+    load_training_state: bool | None = None,
+) -> dict:
     """
     Make a copy of the input config that doesn't require S3 for checkpointing
     and I/O in the callbacks.
@@ -80,6 +116,19 @@ def build_no_s3_run_v2(job: dict, local_path: bool = False, resumable: bool = Fa
     helper. Required for warmup / SF experiments that need their per-experiment
     overrides (action_dim, batch_size, lr, load_path, ...) to survive the no-S3
     transformation.
+
+    Args:
+        job: Source experiment LazyDict / dict.
+        local_path: If True, use ``job["checkpoint"]["load_path"]`` verbatim
+            instead of resolving via ``get_checkpoint_path`` (S3 lookup).
+        resumable: If True, use a fixed ``..._no_s3_resumable`` job name so
+            ``path_local`` is stable across SLURM re-runs.
+        load_training_state: Override the value written into the ``checkpoint``
+            override block. If ``None`` (default), defaults to ``resumable``
+            for back-compat. Set explicitly to decouple. See
+            ``build_no_s3_run`` for full explanation of the trainer's Path-1
+            vs Path-2 resume logic and why this flag only matters on the first
+            cold start (not on SLURM re-runs).
     """
     from copy import deepcopy
 
@@ -112,6 +161,10 @@ def build_no_s3_run_v2(job: dict, local_path: bool = False, resumable: bool = Fa
     else:
         job_name = f"{job_dict['job']['name']}_no_s3" + "_${now:%Y-%m-%d}_${now:%H-%M-%S}"
 
+    # Default load_training_state to resumable's value (back-compat).
+    if load_training_state is None:
+        load_training_state = resumable
+
     # Define the no-S3 specific overrides
     no_s3_overrides = dict(
         job=dict(
@@ -122,9 +175,10 @@ def build_no_s3_run_v2(job: dict, local_path: bool = False, resumable: bool = Fa
             save_to_object_store=dict(enabled=False, credentials=""),
             load_from_object_store=dict(enabled=False),
             load_path=load_path,
-            # For resumable runs, load the full training state (optimizer, scheduler, etc.)
-            # when resuming from the latest checkpoint in the same directory.
-            load_training_state=resumable,
+            # See build_no_s3_run for explanation: only affects the very first
+            # cold start (Path-2 resume); SLURM re-runs always load all keys
+            # from path_local/latest_checkpoint.txt (Path-1 resume).
+            load_training_state=load_training_state,
         ),
         trainer=dict(
             straggler_detection=dict(enabled=False),
