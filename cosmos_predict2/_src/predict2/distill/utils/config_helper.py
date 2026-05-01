@@ -20,6 +20,7 @@ def build_no_s3_run(
     local_path: bool = False,
     resumable: bool = False,
     load_training_state: bool | None = None,
+    wandb_mode: str = "offline",
 ) -> dict:
     """
     Make a copy of the input config that doesn't require S3 for checkpointing
@@ -40,6 +41,12 @@ def build_no_s3_run(
             keep fixed path_local but NOT inherit the teacher checkpoint's
             optimizer/scheduler/trainer state on the first run (cleaner Adam
             warmup for objectives that differ from the teacher's loss).
+        wandb_mode: WandB sync mode. Default ``"offline"`` for back-compat
+            (the legacy "no_s3" semantics bundled WandB cloud sync with the
+            checkpoint S3 backend, which is wrong: WandB cloud uses its own
+            HTTPS API independent of our S3 setup). Set to ``"online"`` to
+            stream metrics live to wandb.ai (overrides ``wandb_util.py``'s
+            explicit ``mode=`` kwarg, which ignores ``WANDB_MODE`` env var).
     """
     # If local_path is True, use the local path as the load path
     if local_path:
@@ -64,7 +71,7 @@ def build_no_s3_run(
         defaults=defaults + ["_self_"] if "_self_" not in defaults else defaults,
         job=dict(
             name=job_name,
-            wandb_mode="offline",
+            wandb_mode=wandb_mode,
         ),
         checkpoint=dict(
             save_to_object_store=dict(enabled=False, credentials=""),
@@ -102,6 +109,7 @@ def build_no_s3_run_v2(
     local_path: bool = False,
     resumable: bool = False,
     load_training_state: bool | None = None,
+    wandb_mode: str = "offline",
 ) -> dict:
     """
     Make a copy of the input config that doesn't require S3 for checkpointing
@@ -129,6 +137,9 @@ def build_no_s3_run_v2(
             ``build_no_s3_run`` for full explanation of the trainer's Path-1
             vs Path-2 resume logic and why this flag only matters on the first
             cold start (not on SLURM re-runs).
+        wandb_mode: WandB sync mode. Default ``"offline"`` for back-compat.
+            See ``build_no_s3_run`` for the rationale on why this is decoupled
+            from the checkpoint S3 backend setting.
     """
     from copy import deepcopy
 
@@ -169,7 +180,7 @@ def build_no_s3_run_v2(
     no_s3_overrides = dict(
         job=dict(
             name=job_name,
-            wandb_mode="offline",
+            wandb_mode=wandb_mode,
         ),
         checkpoint=dict(
             save_to_object_store=dict(enabled=False, credentials=""),

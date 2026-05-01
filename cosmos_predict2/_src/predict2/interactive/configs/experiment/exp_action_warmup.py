@@ -247,5 +247,9 @@ cs.store(
         local_path=True,
         resumable=True,
         load_training_state=False,
+        # Stream training metrics live to wandb.ai (matching the teacher
+        # fine-tune). Independent of the checkpoint S3 backend (which stays
+        # off via load_from_object_store/save_to_object_store=False).
+        wandb_mode="online",
     ),
 )
