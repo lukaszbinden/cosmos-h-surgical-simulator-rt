@@ -18,7 +18,11 @@ import math
 from hydra.core.config_store import ConfigStore
 
 from cosmos_predict2._src.imaginaire.lazy_config import LazyDict
-from cosmos_predict2._src.predict2.distill.utils.config_helper import build_no_s3_run, deep_update_config_dict
+from cosmos_predict2._src.predict2.distill.utils.config_helper import (
+    build_no_s3_run,
+    build_no_s3_run_v2,
+    deep_update_config_dict,
+)
 from cosmos_predict2._src.predict2.models.video2world_model import HighSigmaStrategy
 from cosmos_predict2._src.predict2.text_encoders.text_encoder import EmbeddingConcatStrategy
 
@@ -295,5 +299,10 @@ cs.store(
     group="experiment",
     package="_global_",
     name="cosmos_predict2p5_2B_action_gr00t_gr1_self_forcing_no_s3",
-    node=build_no_s3_run(ACTION_GR00T_GR1_SELF_FORCING),
+    # Use v2 + local_path=True to skip the S3 lookup at module-import time:
+    # ACTION_GR00T_GR1_SELF_FORCING.checkpoint.load_path is a placeholder
+    # ("interactive_warmup/gr1_i4/checkpoints/iter_000002000") that is NOT in
+    # the local checkpoint DB, so the v1 path's get_checkpoint_path(s3_url)
+    # would raise ValueError at import time. Matches SF debug's pattern.
+    node=build_no_s3_run_v2(ACTION_GR00T_GR1_SELF_FORCING, local_path=True, resumable=False),
 )
