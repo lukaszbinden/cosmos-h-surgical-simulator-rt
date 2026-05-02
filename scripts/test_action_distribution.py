@@ -55,9 +55,21 @@ A "healthy" report has:
   - Identity check passes for all M sampled indices
   - Per-subset statistics show no extreme outliers
 
+Sample-count parameters (note the asymmetry):
+
+  --num_samples:        how many samples to pull from MixedLeRobotDataset (the
+                        slow path -- video decode + transforms). Default 1000
+                        is statistically sufficient for distribution stats.
+  --cache_num_samples:  how many cache <idx>.json files to load (cheap, ~ms
+                        per file). Default None = load ALL files in the cache
+                        directory. The JHU dVRK Phase 0 cache has 10,000
+                        files; the SF-debug GR1 cache had 1,000.
+
 Usage examples:
 
-  # JHU dVRK Mono - current run; cache lives in the repo root on the cluster
+  # JHU dVRK Mono - current run; cache lives in the repo root on the cluster.
+  # By default we read all 10,000 cache files but only sample 1,000 from the
+  # MixedLeRobotDataset (since dataset sampling is the slow path).
   DEBUG_NORMALIZATION=1 python scripts/test_action_distribution.py \\
       --dataset_specs JHU_DVRK_MONO_FINETUNE_TRAIN_DATASET_SPECS \\
       --teacher_cache_path datasets/jhu_dvrk_mono_warmup_4step/actions \\
@@ -65,11 +77,18 @@ Usage examples:
       --identity_check_count 100 \\
       --verbose
 
-  # Same, but uniform sampling across the full mixture for representative stats
+  # Same, but uniform sampling across the full 9-subset mixture for a
+  # mixture-representative training-pipeline view.
   DEBUG_NORMALIZATION=1 python scripts/test_action_distribution.py \\
       --dataset_specs JHU_DVRK_MONO_FINETUNE_TRAIN_DATASET_SPECS \\
       --num_samples 1000 \\
       --uniform
+
+  # Cache-only quick check (no lustre dataset access needed)
+  DEBUG_NORMALIZATION=1 python scripts/test_action_distribution.py \\
+      --dataset_specs JHU_DVRK_MONO_FINETUNE_TRAIN_DATASET_SPECS \\
+      --teacher_cache_path datasets/jhu_dvrk_mono_warmup_4step/actions \\
+      --skip_dataset
 
   # Future chole fine-tune (single-dataset mixture)
   DEBUG_NORMALIZATION=1 python scripts/test_action_distribution.py \\
@@ -137,7 +156,23 @@ def parse_arguments() -> argparse.Namespace:
         "--num_samples",
         type=int,
         default=1000,
-        help="Number of samples to draw from each source (default: 1000).",
+        help=(
+            "Number of samples to draw from MixedLeRobotDataset (training pipeline). "
+            "Default 1000 -- statistically sufficient for distribution stats and avoids "
+            "the expensive video-decode + transform path running for too long. "
+            "Bump this if you need tighter per-dim std estimates or richer per-subset "
+            "coverage with --uniform sampling."
+        ),
+    )
+    parser.add_argument(
+        "--cache_num_samples",
+        type=int,
+        default=None,
+        help=(
+            "Number of cache files (<idx>.json) to load. Default None -- load ALL files "
+            "found in the --teacher_cache_path directory (cache loading is cheap: ~ms per "
+            "file). Set to a smaller value to sample a subset only."
+        ),
     )
     parser.add_argument(
         "--num_frames",
@@ -369,11 +404,12 @@ def collect_dataset_actions(
 
 
 def collect_cache_actions(
-    cache_dir: str, num_samples: int, subset_info: list[dict]
+    cache_dir: str, num_samples: Optional[int], subset_info: list[dict]
 ) -> tuple[np.ndarray, list[int], list[Optional[int]]]:
     """Load the first ``num_samples`` action JSON files from the cache.
 
     Files are expected to be named ``<idx>.json`` with content shape (T, D).
+    If ``num_samples`` is None, all available files are loaded.
     Returns (actions_TxD_concatenated, sorted_indices, sample_subsets)."""
     cache_path = Path(cache_dir)
     json_files = sorted(
@@ -382,7 +418,10 @@ def collect_cache_actions(
     )
     if not json_files:
         raise FileNotFoundError(f"No <idx>.json files found in {cache_dir}")
-    json_files = json_files[:num_samples]
+    total_available = len(json_files)
+    if num_samples is not None:
+        json_files = json_files[:num_samples]
+    print(f"  cache files available: {total_available}, loading: {len(json_files)}")
 
     sample_chunks: list[np.ndarray] = []
     indices: list[int] = []
@@ -872,7 +911,11 @@ def main() -> None:
     print(f"  cwd:                 {os.getcwd()}")
     print(f"  dataset_specs:       {args.dataset_specs}")
     print(f"  teacher_cache_path:  {args.teacher_cache_path or '(none)'}")
-    print(f"  num_samples:         {args.num_samples}")
+    print(f"  num_samples:         {args.num_samples}  (dataset sampling)")
+    print(
+        f"  cache_num_samples:   "
+        f"{args.cache_num_samples if args.cache_num_samples is not None else '(all available)'}"
+    )
     print(f"  num_frames:          {args.num_frames}")
     print(f"  data_split:          {args.data_split}")
     print(f"  test_split_ratio:    {args.test_split_ratio}")
@@ -936,7 +979,7 @@ def main() -> None:
         _section(f"LOADING TEACHER CACHE  ({args.teacher_cache_path})")
         try:
             cache_actions, cache_indices, cache_subsets = collect_cache_actions(
-                args.teacher_cache_path, args.num_samples, subset_info
+                args.teacher_cache_path, args.cache_num_samples, subset_info
             )
         except Exception as e:
             print(f"  FATAL: failed to load cache: {e}")
