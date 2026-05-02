@@ -103,8 +103,19 @@ import glob
 import json
 import os
 import sys
+import warnings
 from pathlib import Path
 from typing import Any, Optional
+
+# Silence the torchvision video-decode deprecation noise that fires on every
+# video sample load. Without this, a 2000-sample run produces ~4500 lines of
+# "torchvision are deprecated from version 0.22 ..." spam that drowns out the
+# actual analysis output. Set TEST_AD_KEEP_WARNINGS=1 to opt back in.
+if os.environ.get("TEST_AD_KEEP_WARNINGS", "0") != "1":
+    warnings.filterwarnings(
+        "ignore",
+        message=".*video decoding and encoding capabilities of torchvision.*",
+    )
 
 import numpy as np
 from tqdm import tqdm
@@ -650,12 +661,51 @@ def print_per_subset(
     return out
 
 
+def _compare_arrays(actions1: np.ndarray, actions2: np.ndarray) -> dict[str, Any]:
+    """Pure stats comparison helper used by both full and matched-N comparisons."""
+    mean1 = actions1.mean(axis=0)
+    mean2 = actions2.mean(axis=0)
+    std1 = actions1.std(axis=0)
+    std2 = actions2.std(axis=0)
+    mean_diff = np.abs(mean1 - mean2)
+    std_diff = np.abs(std1 - std2)
+    max_mean_dim = int(np.argmax(mean_diff))
+    max_std_dim = int(np.argmax(std_diff))
+    return {
+        "n1": int(actions1.shape[0]),
+        "n2": int(actions2.shape[0]),
+        "max_mean_diff": float(mean_diff[max_mean_dim]),
+        "max_mean_dim": max_mean_dim,
+        "max_std_diff": float(std_diff[max_std_dim]),
+        "max_std_dim": max_std_dim,
+        "avg_mean_diff": float(mean_diff.mean()),
+        "avg_std_diff": float(std_diff.mean()),
+        "mean_diff_per_dim": mean_diff.tolist(),
+        "std_diff_per_dim": std_diff.tolist(),
+    }
+
+
 def compare_distributions(
     name1: str,
     actions1: np.ndarray,
     name2: str,
     actions2: np.ndarray,
+    chunk_size1: int = 1,
+    chunk_size2: int = 1,
 ) -> dict[str, Any]:
+    """Two-part comparison:
+
+    1. Full-distribution (uses all rows of both arrays). Sensitive to sample-size
+       asymmetry when the indices don't overlap (e.g. cache covers more episodes
+       than the dataset slice we sampled).
+
+    2. Matched-N (truncates both to the SAME first-N action steps). When sequential
+       sampling is used and indices overlap, this is a near-exact comparison of
+       the same underlying samples and should always pass tightly. If the identity
+       check passes 100/100 but matched-N still WARNs, then there's a real
+       transform-stack drift; if matched-N passes and only the full-distribution
+       check WARNs, the WARN is purely a sample-size artifact.
+    """
     _subsection(f"COMPARISON - {name1} vs {name2}")
     if actions1.shape[1] != actions2.shape[1]:
         print(
@@ -663,51 +713,102 @@ def compare_distributions(
         )
         return {"skipped": True, "reason": "dim_mismatch"}
 
-    mean1 = actions1.mean(axis=0)
-    mean2 = actions2.mean(axis=0)
-    std1 = actions1.std(axis=0)
-    std2 = actions2.std(axis=0)
-    mean_diff = np.abs(mean1 - mean2)
-    std_diff = np.abs(std1 - std2)
-
-    max_mean_dim = int(np.argmax(mean_diff))
-    max_std_dim = int(np.argmax(std_diff))
-    max_mean_diff = float(mean_diff[max_mean_dim])
-    max_std_diff = float(std_diff[max_std_dim])
+    full_stats = _compare_arrays(actions1, actions2)
     print(
-        f"  per-dim mean abs-diff:   max={max_mean_diff:.6f} (dim {max_mean_dim}),  "
-        f"avg={float(mean_diff.mean()):.6f}"
+        f"  [full distribution]   "
+        f"n_steps_{name1}={full_stats['n1']}, n_steps_{name2}={full_stats['n2']}"
     )
     print(
-        f"  per-dim std abs-diff:    max={max_std_diff:.6f} (dim {max_std_dim}),  "
-        f"avg={float(std_diff.mean()):.6f}"
+        f"    per-dim mean abs-diff:   max={full_stats['max_mean_diff']:.6f} "
+        f"(dim {full_stats['max_mean_dim']}),  avg={full_stats['avg_mean_diff']:.6f}"
     )
-
-    mean_ok = max_mean_diff < COMPARISON_MEAN_TOL
-    std_ok = max_std_diff < COMPARISON_STD_TOL
-    if mean_ok and std_ok:
+    print(
+        f"    per-dim std abs-diff:    max={full_stats['max_std_diff']:.6f} "
+        f"(dim {full_stats['max_std_dim']}),  avg={full_stats['avg_std_diff']:.6f}"
+    )
+    full_mean_ok = full_stats["max_mean_diff"] < COMPARISON_MEAN_TOL
+    full_std_ok = full_stats["max_std_diff"] < COMPARISON_STD_TOL
+    if full_mean_ok and full_std_ok:
         print(
-            f"  [OK] distributions match within tolerance "
+            f"    [OK] full-distribution match within tol "
             f"(mean_tol={COMPARISON_MEAN_TOL}, std_tol={COMPARISON_STD_TOL})"
         )
     else:
-        if not mean_ok:
-            print(
-                f"  [WARN] max mean diff {max_mean_diff:.4f} exceeds tol {COMPARISON_MEAN_TOL} (dim {max_mean_dim})"
+        size_caveat = ""
+        if full_stats["n1"] != full_stats["n2"]:
+            ratio = max(full_stats["n1"], full_stats["n2"]) / max(min(full_stats["n1"], full_stats["n2"]), 1)
+            size_caveat = (
+                f" -- NOTE: sample-size mismatch ({full_stats['n1']} vs {full_stats['n2']}, "
+                f"ratio {ratio:.1f}x); see matched-N comparison below"
             )
-        if not std_ok:
+        if not full_mean_ok:
             print(
-                f"  [WARN] max std diff {max_std_diff:.4f} exceeds tol {COMPARISON_STD_TOL} (dim {max_std_dim})"
+                f"    [WARN] max mean diff {full_stats['max_mean_diff']:.4f} exceeds tol "
+                f"{COMPARISON_MEAN_TOL} (dim {full_stats['max_mean_dim']}){size_caveat}"
             )
+        if not full_std_ok:
+            print(
+                f"    [WARN] max std diff {full_stats['max_std_diff']:.4f} exceeds tol "
+                f"{COMPARISON_STD_TOL} (dim {full_stats['max_std_dim']}){size_caveat}"
+            )
+
+    matched_stats = None
+    matched_ok = None
+    n1_samples = actions1.shape[0] // max(chunk_size1, 1)
+    n2_samples = actions2.shape[0] // max(chunk_size2, 1)
+    n_matched_samples = min(n1_samples, n2_samples)
+    if n_matched_samples > 0 and chunk_size1 > 0 and chunk_size2 > 0:
+        n_matched_rows1 = n_matched_samples * chunk_size1
+        n_matched_rows2 = n_matched_samples * chunk_size2
+        matched_stats = _compare_arrays(
+            actions1[:n_matched_rows1], actions2[:n_matched_rows2]
+        )
+        print(
+            f"  [matched-N first {n_matched_samples} samples]   "
+            f"n_steps_{name1}={matched_stats['n1']}, n_steps_{name2}={matched_stats['n2']}"
+        )
+        print(
+            f"    per-dim mean abs-diff:   max={matched_stats['max_mean_diff']:.6f} "
+            f"(dim {matched_stats['max_mean_dim']}),  avg={matched_stats['avg_mean_diff']:.6f}"
+        )
+        print(
+            f"    per-dim std abs-diff:    max={matched_stats['max_std_diff']:.6f} "
+            f"(dim {matched_stats['max_std_dim']}),  avg={matched_stats['avg_std_diff']:.6f}"
+        )
+        matched_mean_ok = matched_stats["max_mean_diff"] < COMPARISON_MEAN_TOL
+        matched_std_ok = matched_stats["max_std_diff"] < COMPARISON_STD_TOL
+        matched_ok = bool(matched_mean_ok and matched_std_ok)
+        if matched_ok:
+            print(
+                f"    [OK] matched-N match within tol "
+                f"(mean_tol={COMPARISON_MEAN_TOL}, std_tol={COMPARISON_STD_TOL})"
+            )
+        else:
+            if not matched_mean_ok:
+                print(
+                    f"    [WARN] max mean diff {matched_stats['max_mean_diff']:.4f} exceeds tol "
+                    f"{COMPARISON_MEAN_TOL} (dim {matched_stats['max_mean_dim']}) -- TRUE pipeline drift"
+                )
+            if not matched_std_ok:
+                print(
+                    f"    [WARN] max std diff {matched_stats['max_std_diff']:.4f} exceeds tol "
+                    f"{COMPARISON_STD_TOL} (dim {matched_stats['max_std_dim']}) -- TRUE pipeline drift"
+                )
+
     return {
         "skipped": False,
-        "max_mean_diff": max_mean_diff,
-        "max_mean_dim": max_mean_dim,
-        "max_std_diff": max_std_diff,
-        "max_std_dim": max_std_dim,
-        "mean_diff_per_dim": mean_diff.tolist(),
-        "std_diff_per_dim": std_diff.tolist(),
-        "passes_tolerance": bool(mean_ok and std_ok),
+        "full": full_stats,
+        "full_passes_tolerance": bool(full_mean_ok and full_std_ok),
+        "matched": matched_stats,
+        "matched_passes_tolerance": matched_ok,
+        # Backward-compat top-level fields (used by the JSON report consumers).
+        "max_mean_diff": full_stats["max_mean_diff"],
+        "max_mean_dim": full_stats["max_mean_dim"],
+        "max_std_diff": full_stats["max_std_diff"],
+        "max_std_dim": full_stats["max_std_dim"],
+        "mean_diff_per_dim": full_stats["mean_diff_per_dim"],
+        "std_diff_per_dim": full_stats["std_diff_per_dim"],
+        "passes_tolerance": bool(full_mean_ok and full_std_ok),
     }
 
 
@@ -858,11 +959,41 @@ def healthy_summary(
         )
 
     if comparison is not None and not comparison.get("skipped"):
-        _check(
-            "cache vs dataset distributions match",
-            bool(comparison["passes_tolerance"]),
-            f"max_mean_diff={comparison['max_mean_diff']:.4f}, max_std_diff={comparison['max_std_diff']:.4f}",
-        )
+        # Prefer the matched-N comparison for the verdict when both checks ran.
+        # The matched-N check is the apples-to-apples one (same indices in both
+        # arrays); the full-distribution check is informational and naturally
+        # WARNs when sample sizes differ.
+        if comparison.get("matched") is not None:
+            matched = comparison["matched"]
+            matched_ok = bool(comparison.get("matched_passes_tolerance"))
+            _check(
+                "cache vs dataset distributions match (matched-N, indices overlap)",
+                matched_ok,
+                f"n={min(matched['n1'], matched['n2'])}, "
+                f"max_mean_diff={matched['max_mean_diff']:.4f}, "
+                f"max_std_diff={matched['max_std_diff']:.4f}",
+            )
+            full = comparison["full"]
+            if full["n1"] != full["n2"]:
+                # Informational only -- not a pass/fail signal.
+                checks.append(
+                    (
+                        "cache vs dataset full-distribution (informational, n_cache != n_dataset)",
+                        True,
+                        f"n_cache={full['n1']}, n_dataset={full['n2']}, "
+                        f"max_mean_diff={full['max_mean_diff']:.4f}, "
+                        f"max_std_diff={full['max_std_diff']:.4f}  "
+                        f"(use --num_samples {max(full['n1'], full['n2']) // max(min(full['n1'], full['n2']), 1) * (min(full['n1'], full['n2']) // 12)} "
+                        f"to balance)",
+                    )
+                )
+        else:
+            _check(
+                "cache vs dataset distributions match",
+                bool(comparison["passes_tolerance"]),
+                f"max_mean_diff={comparison['max_mean_diff']:.4f}, "
+                f"max_std_diff={comparison['max_std_diff']:.4f}",
+            )
 
     if identity is not None and not identity.get("skipped"):
         _check(
@@ -1050,8 +1181,15 @@ def main() -> None:
     comparison = None
     if dataset_actions is not None and cache_actions is not None:
         _section("CACHE vs DATASET COMPARISON")
+        cache_chunk = (
+            cache_actions.shape[0] // max(len(cache_indices), 1)
+            if len(cache_indices) > 0
+            else 1
+        )
+        dataset_chunk = chunk_size if chunk_size > 0 else 1
         comparison = compare_distributions(
-            "cache", cache_actions, "dataset", dataset_actions
+            "cache", cache_actions, "dataset", dataset_actions,
+            chunk_size1=cache_chunk, chunk_size2=dataset_chunk,
         )
 
     identity = None
