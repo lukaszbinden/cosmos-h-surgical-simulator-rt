@@ -281,6 +281,71 @@ ACTION_GR00T_G1_SELF_FORCING = make_experiment(
     ),
 )
 
+# ============================================================================
+# JHU dVRK Mono Self-Forcing (Phase 2 of the SF pipeline for the surgical sim)
+# ============================================================================
+# Distills a streaming-capable student model from the annealed JHU dVRK teacher
+# using the warmup-trained student as init. Output checkpoint is the input to
+# the realtime simulator in flashsim-jg.
+#
+# Recipe rationale (vs upstream gr1, also vs SF debug's SutureBot):
+#   - action_dim = 44 in net / net_fake_score / net_teacher  (JHU dVRK MAX_ACTION_DIM)
+#   - resolution = "288"                                       (matches teacher's 288x512)
+#   - rope_h/w_extrapolation_ratio = 3.0 (inherited from upstream defaults).
+#     Critical: our annealed teacher was trained with these exact values
+#     (see exp_2B_action_conditioned_rectify_flow_gr00t.py:148-150) -- a RoPE
+#     mismatch between student and teacher would systematically shift the
+#     student's attention patterns relative to the teacher's targets.
+#   - 8 nodes x 8 GPUs x bs=1 = 64 effective batch (vs upstream 16 x 1 = 128).
+#     Linear LR scaling: optimizer.lr 1e-7 -> 5e-8;
+#                        discriminator/fake_score lr 1e-5 -> 5e-6.
+#     Same logic as SF debug used (4 nodes -> 2.5e-8 / 2.5e-6), just for 8 nodes.
+#   - max_iter = 1000 inherited from make_experiment defaults (upstream + SF debug).
+#   - data = jhu_dvrk_mono_warmup -- reuse the Phase 0 cache (already registered
+#     in interactive/configs/data.py); same data the warmup-student was trained on.
+#   - checkpoint.load_path = warmup-student DCP (init for self.net + self.net_fake_score).
+#   - teacher_load_from.load_path = annealed teacher DCP /model subfolder
+#     (init for self.net_teacher).
+# ============================================================================
+ACTION_JHU_DVRK_MONO_SELF_FORCING = make_experiment(
+    name="jhu_dvrk_mono_i4-sf",
+    data="jhu_dvrk_mono_warmup",
+    overrides=dict(
+        job=dict(
+            project="cosmos_predict2_action_conditioned",
+            group="interactive_self_forcing",
+        ),
+        checkpoint=dict(
+            # Warmup-student DCP shard from Phase 1 (NOT a .pt file).
+            # Used to initialize self.net and (with init_student_with_teacher=True)
+            # also self.net_fake_score's matching parameters.
+            load_path="/lustre/fsw/portfolios/healthcareeng/projects/healthcareeng_holoscan/users/lzbinden/imaginaire/output/cosmos_predict2_action_conditioned/interactive_warmup/jhu_dvrk_mono_i4_lr3e-5_no_s3_resumable/checkpoints/iter_000020000",
+        ),
+        # 8 nodes x bs=1 = 64 effective batch (vs upstream 16 x 1 = 128)
+        # => linearly scale lr 1e-7 -> 5e-8.
+        optimizer=dict(lr=5e-8),
+        model=dict(
+            config=dict(
+                net=dict(action_dim=44),
+                net_fake_score=dict(action_dim=44),
+                net_teacher=dict(action_dim=44),
+                # Same linear scaling for the auxiliary optimizers.
+                optimizer_discriminator_config=dict(lr=5e-6),
+                optimizer_fake_score_config=dict(lr=5e-6),
+                # JHU teacher's training resolution.
+                resolution="288",
+                # Annealed JHU dVRK teacher DCP. The /model subfolder is the
+                # DCP convention (NOT a .pt file). credentials="" because we're
+                # loading from local lustre, not S3.
+                teacher_load_from=dict(
+                    load_path="/lustre/fsw/portfolios/healthcareeng/projects/healthcareeng_holoscan/users/lzbinden/imaginaire/output/cosmos_predict2_action_conditioned/official_runs_vid2vid/cosmos_predict2p5_2B_action_conditioned_jhu_dvrk_mono_finetune_13frame_8nodes_release_oss_fine_anneal_4k/checkpoints/iter_000004000/model",
+                    credentials="",
+                ),
+            ),
+        ),
+    ),
+)
+
 cs = ConfigStore.instance()
 
 cs.store(
@@ -305,4 +370,38 @@ cs.store(
     # the local checkpoint DB, so the v1 path's get_checkpoint_path(s3_url)
     # would raise ValueError at import time. Matches SF debug's pattern.
     node=build_no_s3_run_v2(ACTION_GR00T_GR1_SELF_FORCING, local_path=True, resumable=False),
+)
+# JHU dVRK Mono SF: resumable variant for SLURM array re-runs.
+# Same decoupled flags as the JHU warmup registration in exp_action_warmup.py:
+#   - resumable=True            -> fixed ..._no_s3_resumable job name so
+#                                  path_local is stable across re-runs (Path-1
+#                                  resume picks up the latest SF checkpoint).
+#   - load_training_state=False -> first cold start loads only the warmup-
+#                                  student's `model` weights into self.net (and
+#                                  init_student_with_teacher copies into
+#                                  self.net_fake_score). Optim / scheduler /
+#                                  trainer state are NOT inherited from the
+#                                  warmup checkpoint -- the warmup objective
+#                                  (MSE on cached teacher latents) is different
+#                                  from the SF objective (DMD / GAN / fake-score
+#                                  losses on online teacher rollouts), so
+#                                  inheriting Adam moments would mis-scale the
+#                                  adaptive LR. Re-runs always load all keys
+#                                  from path_local (Path-1) regardless.
+#   - wandb_mode="online"       -> stream metrics live to wandb.ai (matches
+#                                  warmup, matches teacher fine-tune).
+# Build_no_s3_run_v2 is used so the JHU-specific overrides (action_dim=44,
+# lr=5e-8, resolution, load_path, teacher_load_from, ...) survive the no-S3
+# transformation.
+cs.store(
+    group="experiment",
+    package="_global_",
+    name="cosmos_predict2p5_2B_action_jhu_dvrk_mono_self_forcing_no_s3_resumable",
+    node=build_no_s3_run_v2(
+        ACTION_JHU_DVRK_MONO_SELF_FORCING,
+        local_path=True,
+        resumable=True,
+        load_training_state=False,
+        wandb_mode="online",
+    ),
 )
