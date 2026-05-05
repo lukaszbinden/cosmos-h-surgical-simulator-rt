@@ -203,10 +203,14 @@ cython_debug/
 /results/
 /tmp/
 
+# In-training validation hook artifacts (validation_quant_eval.py callback +
+# validation_sbatch_watcher.sh).  Per-iteration metrics / videos / sbatch
+# queue files are runtime outputs, never source.
+/validation/
+
 !assets/**/*.png
 !assets/**/*.jpg
 !assets/**/*.mp4
 
 .idea/
 
-data/

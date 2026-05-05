@@ -41,7 +41,11 @@ torchrun --nproc_per_node=8 --master_port=12341 -m scripts.train \
 
 ## Downstream Fine-Tuning
 
-The multi-embodiment Open-H model serves as a foundation for further specialization on individual datasets. For example, fine-tuning on SutureBot (dVRK JHU). The 20D SutureBot actions are zero-padded to 44D automatically:
+The multi-embodiment Open-H model serves as a foundation for further specialization on individual datasets. The 20D dual-arm dVRK actions are zero-padded to 44D automatically.
+
+### SutureBot (legacy, single pre-concatenated LeRobot bundle)
+
+Fine-tune on the original JHU SutureBot dVRK bundle (pre-concatenated 20D action format, `EmbodimentTag.SUTUREBOT`):
 
 ```bash
 torchrun --nproc_per_node=8 --master_port=12341 -m scripts.train \
@@ -49,6 +53,19 @@ torchrun --nproc_per_node=8 --master_port=12341 -m scripts.train \
   -- experiment=cosmos_predict2p5_2B_action_conditioned_suturebot_13frame_4nodes_release_oss \
   ~dataloader_train.dataloaders
 ```
+
+### JHU dVRK Mono (recommended, 9-subset tabletop mixture)
+
+Fine-tune on all 9 JHU dVRK tabletop subsets (`hf_suturebot` + 8 newly-converted failure / OOD subsets from JHU Open-H_failures_ood), unified under `EmbodimentTag.JHU_DVRK_MONO`:
+
+```bash
+torchrun --nproc_per_node=8 --master_port=12341 -m scripts.train \
+  --config=cosmos_predict2/_src/predict2/action/configs/action_conditioned/config.py \
+  -- experiment=cosmos_predict2p5_2B_action_conditioned_jhu_dvrk_mono_finetune_13frame_8nodes_release_oss \
+  ~dataloader_train.dataloaders
+```
+
+The mixture composition and per-subset mix ratios are defined by `JHU_DVRK_MONO_FINETUNE_DATASET_SPECS` in `groot_configs.py`. Recipe matches the C-H-S-S Open-H 8-node run: 8 nodes × 8 GPUs × `batch_size=16` (effective batch 1024), `lr=1.6e-4`, training resolution 512×288 (W×H). Effective training rate is 10 Hz (30 Hz raw × `timestep_interval=3`); all 9 subsets must have a matching `meta/stats_cosmos.json` computed with `--timestep-interval 3` (see `scripts/compute_openh_action_stats.py`). A mismatched or missing stamp will raise at dataset load time. Warm-start is the C-H-S-S Open-H pre-trained 44D checkpoint (see `checkpoint.load_path` in the experiment block); override with `checkpoint.load_path=...` on the CLI to start from a different checkpoint.
 
 ## Checkpoint Conversion
 

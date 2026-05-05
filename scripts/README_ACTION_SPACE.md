@@ -5,7 +5,16 @@ conditioning space used by the Cosmos Predict-2.5 world model when fine-tuned
 on the [Open-H](https://huggingface.co/datasets/nvidia/Open-H) multi-embodiment
 surgical robotics benchmark.  It also details how non-CMR embodiments map their
 native action spaces into the shared 44D vector via zero-padding, and documents
-the data mixture that governs how each dataset contributes to training.
+the data mixtures that govern how each dataset contributes to training.
+
+The same 44D action space is reused without modification by the downstream
+Cosmos-H-Surgical-Simulator (C-H-S-S) fine-tunes that warm-start from the
+Open-H pretraining checkpoint — for example the **JHU dVRK monocular tabletop
+fine-tune** documented in [Downstream Fine-Tune
+Mixtures](#downstream-fine-tune-mixtures).  Only the data mixture and the
+per-dataset `stats_cosmos.json` normalization files change; the model's
+`action_dim=44` input, the per-embodiment transforms, and the zero-padding
+mechanism are unchanged.
 
 ---
 
@@ -20,11 +29,13 @@ the data mixture that governs how each dataset contributes to training.
    - [Per-Embodiment Details](#per-embodiment-details)
 4. [Zero-Padding Mechanism](#zero-padding-mechanism)
 5. [Transform Pipeline](#transform-pipeline)
-6. [Data Mixture](#data-mixture)
+6. [Data Mixture (Open-H Pretraining)](#data-mixture-open-h-pretraining)
    - [Weighting Strategy](#weighting-strategy)
    - [Full Dataset Specification](#full-dataset-specification)
    - [Training Statistics](#training-statistics)
-7. [Source Code Pointers](#source-code-pointers)
+7. [Downstream Fine-Tune Mixtures](#downstream-fine-tune-mixtures)
+   - [JHU dVRK Monocular Tabletop Fine-Tune](#jhu-dvrk-monocular-tabletop-fine-tune)
+8. [Source Code Pointers](#source-code-pointers)
 
 ---
 
@@ -144,8 +155,7 @@ It includes the full Open-H embodiment registry; the default
 |---|---|---|---|---|
 | `cmr_versius` | **44** | 0 | CMR Surgical Versius | 2x pose(9D) + 2x gripper(1D) + energy(2D) + thumbstick(6D) + clutch(2D) + state_cond(14D) |
 | `rob_surgical` | **36** | 8 | Rob Surgical bitrack | 4x pose(9D) — left, right, lap, aux (no grippers) |
-| `dvrk` | **20** | 24 | da Vinci Research Kit (JHU stereo) | 2x pose(9D) + 2x gripper(1D) |
-| `jhu_dvrk_mono` | **20** | 24 | dVRK JHU (monocular) | 2x pose(9D) + 2x gripper(1D) |
+| `jhu_dvrk_mono` | **20** | 24 | JHU dVRK (da Vinci Research Kit, monocular) | 2x pose(9D) + 2x gripper(1D) |
 | `dvrk_ucb` | **20** | 24 | dVRK UC Berkeley | 2x pose(9D) + 2x gripper(1D) |
 | `dvrk_obuda` | **20** | 24 | dVRK Obuda University | 2x pose(9D) + 2x gripper(1D) |
 | `dvrk_ucsd` | **20** | 24 | dVRK UCSD Surgical Learning | 2x pose(9D) + 2x gripper(1D) |
@@ -163,9 +173,10 @@ It includes the full Open-H embodiment registry; the default
 
 #### Dual-Arm EEF + Gripper (20D)
 
-This is the most common pattern, shared by 8 embodiments (dVRK JHU, UCB,
-Obuda, Stanford, UCSD, Hamlyn, LSCR MIRACLE, LSCR SMARTS).  Each uses the
-helper function `_dual_arm_eef_configs()` in `groot_configs.py`:
+This is the most common pattern, shared by 8 embodiments (JHU dVRK mono,
+dVRK UCB, dVRK Obuda, dVRK Stanford, dVRK UCSD, Hamlyn, LSCR MIRACLE,
+LSCR SMARTS). Each uses the helper function `_dual_arm_eef_configs()` in
+`groot_configs.py`:
 
 ```
 Arm 1: pose (9D via rel_xyz_rot6d) + gripper (1D absolute) = 10D
@@ -333,16 +344,31 @@ handles several CMR-specific concerns:
 ### Normalization
 
 All embodiments use **mean-std (z-score) normalization** for both state and
-action channels.  Statistics are pre-computed per dataset and stored in
-Cosmos-specific stats files.  For non-CMR Open-H embodiments this is
-`meta/stats_cosmos.json`; for CMR Versius this is
-`meta/stats_cosmos-44D.json`.  CMR stats are computed over the 9D
-hybrid-relative pose format (not the raw 7D quaternion format), which is why a
-separate CMR-specific stats file is required.
+action channels.  Statistics are **always pre-computed per dataset** and
+stored in Cosmos-specific stats files — there is no aggregated / global
+normalization across a mixture.  For non-CMR Open-H embodiments the file is
+`meta/stats_cosmos.json`; for CMR Versius it is `meta/stats_cosmos-44D.json`.
+CMR stats are computed over the 9D hybrid-relative pose format (not the raw
+7D quaternion format), which is why a separate CMR-specific stats file is
+required.
+
+Because stats live with each dataset, **downstream fine-tunes that introduce
+new dataset paths must generate their own `stats_cosmos.json` for each new
+subset** — see [JHU dVRK Monocular Tabletop
+Fine-Tune](#jhu-dvrk-monocular-tabletop-fine-tune) for a concrete example.
+The stats *values* differ per subset, but the file name, format, and
+compute pipeline (`scripts/compute_openh_action_stats.py` for non-CMR,
+`scripts/compute_cmr_action_stats.py` for CMR) are unchanged.
 
 ---
 
-## Data Mixture
+## Data Mixture (Open-H Pretraining)
+
+This section describes the **Open-H multi-embodiment pretraining** mixture
+(`OPEN_H_DATASET_SPECS` in `groot_configs.py`) that produces the base
+Cosmos-H-Surgical-Simulator checkpoint.  Downstream single-embodiment
+fine-tunes that warm-start from this checkpoint use their own mixtures —
+see [Downstream Fine-Tune Mixtures](#downstream-fine-tune-mixtures).
 
 ### Weighting Strategy
 
@@ -450,19 +476,150 @@ repeated 1–2x.
 
 ---
 
+## Downstream Fine-Tune Mixtures
+
+Downstream Cosmos-H-Surgical-Simulator (C-H-S-S) fine-tunes warm-start from
+the Open-H 44D pretraining checkpoint and restrict training to a single
+embodiment (or a small family of embodiments).  **The 44D action space itself
+does not change**: the model keeps `action_dim=44`, every sample is still
+zero-padded to 44D by `MixedLeRobotDataset`, and each embodiment's native
+dimension and transform pipeline (described above) are inherited unchanged
+from `EMBODIMENT_REGISTRY`.
+
+What *does* change per fine-tune is:
+
+1. **Data mixture and weighting policy** — a new `*_DATASET_SPECS` list replaces
+   `OPEN_H_DATASET_SPECS` at the dataloader.
+2. **Per-dataset normalization statistics** — each dataset directory in the
+   fine-tune mixture must have its own `meta/stats_cosmos.json` (produced by
+   `scripts/compute_openh_action_stats.py`).  Stats are always per-dataset,
+   never aggregated, so "fine-tune stats" just means running the same compute
+   script on the new dataset paths.
+
+### JHU dVRK Monocular Tabletop Fine-Tune
+
+The first downstream fine-tune, registered as
+`cosmos_predict2p5_2B_action_conditioned_jhu_dvrk_mono_finetune_13frame_8nodes_release_oss`
+in `exp_2B_action_conditioned_rectify_flow_gr00t.py`, trains exclusively on
+the **JHU Imerse `previously_collected_data` tabletop dVRK corpus** under the
+unified `EmbodimentTag.JHU_DVRK_MONO` embodiment.  It warm-starts from the
+Open-H 44D iter-12000-v2 checkpoint and the C-H-S-S is later fine-annealed
+for an additional 4000 cosine-LR steps
+(`..._fine_anneal_4k`, `iter_000004000/model_ema_bf16.pt`).
+
+#### Action space validity
+
+Unchanged.  Every JHU dVRK mono sample produces a 20D action vector
+(2 × pose(9D) + 2 × gripper(1D), using `REL_XYZ_ROT6D` for poses and
+`ABSOLUTE` for grippers) which is then zero-padded by `MixedLeRobotDataset`
+to 44D.  Dimensions 20–43 remain zero, exactly as they were for
+`jhu_dvrk_mono` samples during Open-H pretraining — see the `jhu_dvrk_mono`
+row in the [Summary Table](#summary-table).
+
+#### Dataset specification
+
+`JHU_DVRK_MONO_FINETUNE_{TRAIN,VAL}_DATASET_SPECS` in `groot_configs.py`
+declares **9 subsets / 2,935 episodes / 1,073,506 frames** total, all under
+the same `EmbodimentTag.JHU_DVRK_MONO` embodiment (and therefore sharing the
+same transforms, same `timestep_interval=3` (30 Hz raw → 10 Hz effective), and
+same 20D post-transform native width).
+
+Paths (two lustre mounts):
+- `hf_suturebot` lives under
+  `.../Open-H-lz/Surgical/JHU/Imerse/previously_collected_data/`.
+- The 8 failure / success / OOD subsets live under
+  `.../Open-H_failures_ood/Surgical/JHU/Imerse/previously_collected_data/`
+  (converted from the JHU zarr archives via
+  `scripts/convert_jhu_zarr_to_lerobot.py`).
+
+| Subset | Episodes | Frames | `mix_ratio` | `test_split_ratio` | In val mixture? |
+|---|---:|---:|---:|---:|:---:|
+| `hf_suturebot` | 1,452 | 516,334 | 516,334 | 0.01 | yes |
+| `knot_tying` | 512 | 209,253 | 209,253 | 0.01 | yes |
+| `suture_bot_success` | 10 | 1,557 | 1,557 | 0.02 (default) | yes |
+| `suture_bot_failure` | 46 | 8,793 | 8,793 | 0.02 (default) | yes |
+| `cosmos_fail_filtered` | 163 | 12,948 | 12,948 | 0.02 (default) | yes |
+| `cosmos_throw_fail_demo` | 158 | 54,581 | 54,581 | 0.01 | yes |
+| `cosmos_knot_fail_demo` | 151 | 30,502 | 30,502 | 0.02 (default) | yes |
+| `suturebot_act_throw_eval` | 30 | 11,548 | 11,548 | 0.02 (default) | yes |
+| `ood` | 413 | 227,990 | 227,990 | `data_split_override="full"` | **no** (train-only) |
+| **Total** | **2,935** | **1,073,506** | | | |
+
+#### Weighting policy
+
+**Frame-proportional**: `mix_ratio_i = total_frames_i` for each subset.  This
+mirrors exp_605's 1× `jhu_train` recipe from the earlier Cosmos-Surg-dVRK
+work.  Because `MixedLeRobotDataset._compute_repeat_factors` uses
+`per_sample_weight_i = mix_ratio_i / len(ds_i)`, every subset's weight in
+train mode rounds to `repeat_factor = 1` — i.e. no upsampling, each subset
+contributes in proportion to its frame count.  Equal `mix_ratio = 1.0` was
+deliberately rejected because it would oversample the smallest subset
+(`suture_bot_success`, 1,557 frames) by >300× to match `hf_suturebot`
+(516,334 frames), which is undesirable for this recipe.
+
+#### Train / val split policy
+
+Split ratios are set **per-spec** (via `test_split_ratio_override` on the
+spec dict, defaulting to the constructor-level `test_split_ratio=0.02`) with
+two rationale-driven exceptions:
+
+- Large subsets (`hf_suturebot`, `knot_tying`, `cosmos_throw_fail_demo`) use
+  a tighter `test_split_ratio=0.01` because 1% is already plenty of held-out
+  frames.
+- `ood` uses `data_split_override="full"` — **100%** of its 227,990 frames
+  participate in training and none are held out.  The val mixture
+  (`JHU_DVRK_MONO_FINETUNE_VAL_DATASET_SPECS`) drops `ood` entirely so its
+  samples are never used as validation.
+
+Cosmos-predict2.5's trainer runs `dataloader_val` only rarely in practice
+(`imaginaire/config.py::validation_iter` default `999_999_999`), so the
+held-out test data is mostly inert plumbing — the per-spec ratios above were
+chosen to minimize wasted data while still keeping a symmetric 2% default for
+the tiny subsets.
+
+#### Normalization (per-dataset `stats_cosmos.json`)
+
+Each of the 9 subsets has its own `meta/stats_cosmos.json` file, freshly
+computed with `scripts/compute_openh_action_stats.py` on the transformed
+(20D post-`REL_XYZ_ROT6D` + absolute-gripper) action representation.  These
+values are **different** from the `stats_cosmos.json` files used during
+Open-H pretraining, because the pretraining mixture draws its JHU subsets
+from a different lustre path (`.../huggingface/lerobot/jhu/...`) with
+different recordings (`srth_porcine_chole_fix`, `suturebot_2`, `suturebot_3`,
+etc.) — the two sets of JHU datasets do **not** overlap.
+
+The mechanism is unchanged:
+
+```
+python scripts/compute_openh_action_stats.py \
+    --dataset-path <subset_dir> \
+    --embodiment jhu_dvrk_mono
+```
+
+As always, `stats_cosmos.json` must be present before training — `dataset.py`
+raises a `FileNotFoundError` otherwise and prints the exact command to
+regenerate it.
+
+---
+
 ## Source Code Pointers
 
 | Component | File | Key Classes / Functions |
 |---|---|---|
-| Embodiment registry & dataset specs | [`groot_configs.py`](../cosmos_predict2/_src/predict2/action/datasets/gr00t_dreams/groot_configs.py) | `EMBODIMENT_REGISTRY`, `OPEN_H_DATASET_SPECS`, `MAX_ACTION_DIM`, `construct_modality_config_and_transforms()`, `_build_generic_config_and_transforms()`, `_dual_arm_eef_configs()` |
+| Embodiment registry & Open-H pretrain specs | [`groot_configs.py`](../cosmos_predict2/_src/predict2/action/datasets/gr00t_dreams/groot_configs.py) | `EMBODIMENT_REGISTRY`, `OPEN_H_DATASET_SPECS`, `MAX_ACTION_DIM`, `construct_modality_config_and_transforms()`, `_build_generic_config_and_transforms()`, `_dual_arm_eef_configs()` |
+| JHU dVRK mono finetune specs | [`groot_configs.py`](../cosmos_predict2/_src/predict2/action/datasets/gr00t_dreams/groot_configs.py) | `JHU_DVRK_MONO_FINETUNE_TRAIN_DATASET_SPECS`, `JHU_DVRK_MONO_FINETUNE_VAL_DATASET_SPECS`, `_JHU_DVRK_MONO_FINETUNE_NON_OOD_SPECS`, `_JHU_DVRK_MONO_FINETUNE_OOD_SPEC` |
 | Embodiment tags (enum) | [`embodiment_tags.py`](../cosmos_predict2/_src/predict2/action/datasets/gr00t_dreams/data/embodiment_tags.py) | `EmbodimentTag` |
 | Multi-embodiment dataset & padding | [`dataset.py`](../cosmos_predict2/_src/predict2/action/datasets/gr00t_dreams/data/dataset.py) | `MixedLeRobotDataset`, `WrappedLeRobotSingleDataset` |
 | CMR relative action transform | [`state_action.py`](../cosmos_predict2/_src/predict2/action/datasets/gr00t_dreams/data/transform/state_action.py) | `CMRVersiusRelativeActionTransform`, `convert_to_hybrid_relative_with_engagement()`, `apply_motion_scaling_to_hybrid_relative()` |
 | Generic relative action transform | [`state_action.py`](../cosmos_predict2/_src/predict2/action/datasets/gr00t_dreams/data/transform/state_action.py) | `GenericRelativeActionTransform`, `ActionKeyConfig`, `convert_to_hybrid_relative()` |
 | Normalization | [`state_action.py`](../cosmos_predict2/_src/predict2/action/datasets/gr00t_dreams/data/transform/state_action.py) | `StateActionTransform`, `Normalizer` |
 | Concatenation | [`concat.py`](../cosmos_predict2/_src/predict2/action/datasets/gr00t_dreams/data/transform/concat.py) | `ConcatTransform` |
-| Hydra data registration | [`data.py`](../cosmos_predict2/_src/predict2/action/configs/action_conditioned/data.py) | `open_h_multi_train_dataset`, `open_h_multi_val_dataset` |
-| Model config (action_dim=44) | [`exp_...gr00t.py`](../cosmos_predict2/_src/predict2/action/configs/action_conditioned/experiment/exp_2B_action_conditioned_rectify_flow_gr00t.py) | `AC_CHUNK_SINGLE_VIEW_2B_CMR_13FRAME_44D_8NODES_OSS`, `AC_CHUNK_SINGLE_VIEW_2B_OPEN_H_13FRAME_8NODES_OSS` |
+| Hydra data registration (Open-H) | [`data.py`](../cosmos_predict2/_src/predict2/action/configs/action_conditioned/data.py) | `open_h_multi_train_dataset`, `open_h_multi_val_dataset`, `open_h_multi_train_dataloader`, `open_h_multi_val_dataloader` |
+| Hydra data registration (JHU dVRK mono finetune) | [`data.py`](../cosmos_predict2/_src/predict2/action/configs/action_conditioned/data.py) | `jhu_dvrk_mono_finetune_train_dataset`, `jhu_dvrk_mono_finetune_val_dataset`, `jhu_dvrk_mono_finetune_train_dataloader`, `jhu_dvrk_mono_finetune_val_dataloader` |
+| Open-H pretrain experiment (action_dim=44) | [`exp_...gr00t.py`](../cosmos_predict2/_src/predict2/action/configs/action_conditioned/experiment/exp_2B_action_conditioned_rectify_flow_gr00t.py) | `AC_CHUNK_SINGLE_VIEW_2B_CMR_13FRAME_44D_8NODES_OSS`, `AC_CHUNK_SINGLE_VIEW_2B_OPEN_H_13FRAME_8NODES_OSS` |
+| JHU dVRK mono finetune experiment (action_dim=44) | [`exp_...gr00t.py`](../cosmos_predict2/_src/predict2/action/configs/action_conditioned/experiment/exp_2B_action_conditioned_rectify_flow_gr00t.py) | `AC_CHUNK_SINGLE_VIEW_2B_JHU_DVRK_MONO_FINETUNE_13FRAME_8NODES_OSS`, `AC_CHUNK_SINGLE_VIEW_2B_JHU_DVRK_MONO_FINETUNE_13FRAME_8NODES_OSS_FINE_ANNEAL_4K` |
 | Rotation utilities (rot6d, quat) | [`state_action.py`](../cosmos_predict2/_src/predict2/action/datasets/gr00t_dreams/data/transform/state_action.py) | `rot6d_to_rotation_matrix()`, `rotation_matrix_to_rot6d()`, `quats_to_rotation_matrices()` |
+| Stats compute (non-CMR Open-H / finetunes) | [`compute_openh_action_stats.py`](./compute_openh_action_stats.py) | Generates per-dataset `meta/stats_cosmos.json` in the post-transform representation (e.g. 20D for `jhu_dvrk_mono`) |
+| Stats compute (CMR) | `scripts/compute_cmr_action_stats.py` | Generates per-dataset `meta/stats_cosmos-44D.json` for CMR Versius (clutch-filtering + motion-scaling aware) |
 | Inference (all embodiments) | [`inference_open_h.py`](../cosmos_predict2/_src/predict2/action/inference/inference_open_h.py) | Multi-dataset JSON mode, per-embodiment dataset loading |
 | Inference (CMR only) | [`inference_cmr.py`](../cosmos_predict2/_src/predict2/action/inference/inference_cmr.py) | CMR-specific inference entry point |

@@ -72,9 +72,17 @@ RIGHT hand drives the RIGHT (camera-frame) arm:
     Right Shift         gripper close (hold)
     Right Ctrl          gripper open  (hold)
 
-Modifiers (apply to motion + rotation, NOT gripper):
-    Left Shift   2.0x speed (fast)
-    Left Ctrl    0.25x speed (precision)
+Speed levels (sticky, apply to motion + rotation, NOT gripper):
+    Alt+1 .. Alt+4   Switch the per-held-key speed multiplier between 4
+                     user-configurable scalars (defaults: 0.25x / 1x /
+                     2x / 4x for precision / normal / fast / turbo).
+                     The selected level persists until the next Alt+digit
+                     press; startup default is configurable
+                     (:attr:`ControllerGains.default_speed_level`,
+                     defaults to ``2`` -> 1.0x).  Left and right Alt are
+                     both accepted; on QWERTZ the right-Alt position is
+                     usually AltGr (a separate key emitted as
+                     ``Key.alt_gr``) and will not change speed.
 
 Misc:
     P            print the current 20-D un-padded action snapshot
@@ -195,6 +203,15 @@ except Exception as _pynput_exc:  # noqa: BLE001 - includes display-backend erro
     _PYNPUT_KEY_NAMES = (
         "space", "up", "down", "left", "right",
         "shift", "ctrl", "shift_l", "shift_r", "ctrl_l", "ctrl_r", "esc",
+        # Alt is the live controller's sticky-speed modifier (Alt+1..Alt+N
+        # swaps :attr:`ControllerGains.speed_levels`); ``alt_gr`` is listed
+        # for completeness so the headless import path doesn't crash if any
+        # caller introspects it (we deliberately do NOT bind AltGr).
+        "alt", "alt_l", "alt_r", "alt_gr",
+        # F1 = scene-reset binding (see ``KeyboardController.reset_requested``);
+        # listed here so the offline ``_StubListener`` import path keeps a
+        # distinct sentinel for the key.
+        "f1",
     )
 
     class _StubListener:
@@ -260,16 +277,67 @@ _GRIPPER_OFFSET = 9  # gripper is the last (10th) dim of each per-arm block
 # in ``scripts/generate_open_h_ood_scenarios_depth.py`` (1.0sigma in-plane,
 # 2.5sigma for depth).  Tune via ``ControllerGains`` if motion feels too
 # slow/fast for a given checkpoint.
+#
+# Rotation gain bumped from 0.5 to 1.0sigma after qualitative evaluation of
+# the iter_4k anneal teacher: at 0.5sigma the rendered yaw / pitch / roll
+# response was barely visible (essentially indistinguishable from no
+# rotation), while at 1.0sigma the response is clearly present.  1.0sigma
+# also keeps the per-axis rot6d delta L2 norm at parity with the in-plane
+# translation gain, which is the right default for one-rotation-key-press
+# control fidelity in live use.
 @dataclass
 class ControllerGains:
-    """Per-channel offsets applied per held key, in normalised (sigma) units."""
+    """Per-channel offsets applied per held key, in normalised (sigma) units.
+
+    Speed scaling
+    -------------
+
+    The live :class:`KeyboardController` exposes 4 sticky speed levels
+    selected by ``Alt+1`` .. ``Alt+4``; pressing one of these
+    combinations swaps the active scalar in :attr:`speed_levels` and the
+    new scalar persists until the next ``Alt+digit`` press.  This
+    replaces the older "hold L-Shift for fast / hold L-Ctrl for slow"
+    scheme so the only Shift / Ctrl bindings left in the live controller
+    are the gripper keys (R-Shift / R-Ctrl).
+
+    The legacy :attr:`fast_multiplier` / :attr:`slow_multiplier` fields
+    are retained ONLY for the offline OOD scenario generator at
+    ``scripts/generate_keyboard_input_scenarios.py``, which bakes "fast"
+    or "slow" segments into pre-recorded ``actions.npy`` files.  The
+    live controller ignores them.
+    """
 
     translation_xy: float = 1.0   # x / y in-plane motion
     translation_z: float = 2.0    # z depth (smaller std in data -> needs more)
-    rotation: float = 0.5         # rot6d perturbation per held rotation key
+    rotation: float = 1.0         # rot6d perturbation per held rotation key
     gripper: float = 2.0          # absolute gripper target (held = open/close)
-    fast_multiplier: float = 2.0  # Left-Shift modifier
-    slow_multiplier: float = 0.25  # Left-Ctrl modifier
+
+    # Live-controller speed presets selected by Alt+1 .. Alt+N.  Length
+    # determines how many Alt+digit slots are bound (capped at 9 for
+    # Alt+1..Alt+9).  Defaults give the user precision / normal / fast /
+    # turbo at the canonical 0.25x / 1x / 2x / 4x ratios.
+    speed_levels: tuple[float, ...] = (0.25, 1.0, 2.0, 4.0)
+    # 1-indexed initial level applied at startup, before any Alt+digit
+    # press.  Default ``2`` -> 1.0x in the default speed_levels.
+    default_speed_level: int = 2
+
+    # Deprecated -- only consumed by ``scripts/generate_keyboard_input_scenarios.py``.
+    fast_multiplier: float = 2.0
+    slow_multiplier: float = 0.25
+
+    def __post_init__(self) -> None:
+        n = len(self.speed_levels)
+        if n == 0:
+            raise ValueError("speed_levels must contain at least one scalar")
+        if n > 9:
+            raise ValueError(
+                f"speed_levels supports at most 9 entries (Alt+1..Alt+9); got {n}"
+            )
+        if not 1 <= self.default_speed_level <= n:
+            raise ValueError(
+                f"default_speed_level={self.default_speed_level} out of range "
+                f"[1, {n}] for speed_levels={self.speed_levels}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -315,12 +383,40 @@ def _arm_binds(base: int) -> dict[str, list[_Bind]]:
     Translation and gripper keys produce a single-element list; rotation
     keys may produce multiple entries to target the correct rot6d dims for
     the chosen Euler axis.
+
+    Sign convention -- IMPORTANT for x-axis:
+
+    The semantic keys ``x_pos`` / ``x_neg`` describe *image-frame* intent
+    (``x_pos`` = "move tool to the right in the rendered video";
+    ``x_neg`` = "move tool to the left").  This matches the user-facing
+    documentation and the WASD-style mental model.
+
+    For the JHU dVRK mono training data the underlying ``action`` channel
+    on the corresponding xyz dim is in the **PSM kinematic frame**, which
+    is *mirrored* relative to the camera frame for both PSMs.  Empirically
+    (verified on the iter_4k anneal teacher at 1.0sigma and 2.0sigma),
+    pressing D / Right-arrow with the original ``+1.0`` coef produced
+    image-LEFT motion, and A / Left-arrow with ``-1.0`` produced image-
+    right motion -- the opposite of what the keymap docstring promises.
+
+    We therefore flip the x sign at the bind layer so that the *semantic*
+    intent ("x_pos = image right") translates to the correct *kinematic*
+    sign on the action dim.  This change is transparent to callers: every
+    consumer of ``_arm_binds`` sees ``x_pos`` and ``x_neg`` produce the
+    intuitive image-frame motion direction, without needing to know about
+    the dataset's kinematic-frame convention.
+
+    The y and z axes are unaffected -- both are correctly aligned with
+    the image frame in the data (``+y`` = image up, ``+z`` = into tissue),
+    so ``y_pos`` / ``y_neg`` and ``z_pos`` / ``z_neg`` keep their
+    straightforward signs.
     """
     rot_base = base + _ROT6D_OFFSET
     return {
-        # Translation (3 dims: x, y, z)
-        "x_pos": [_Bind(base + _XYZ_OFFSET + 0, +1.0, "translation")],
-        "x_neg": [_Bind(base + _XYZ_OFFSET + 0, -1.0, "translation")],
+        # Translation (3 dims: x, y, z).
+        # NOTE: x is sign-flipped here; see the function docstring above.
+        "x_pos": [_Bind(base + _XYZ_OFFSET + 0, -1.0, "translation")],
+        "x_neg": [_Bind(base + _XYZ_OFFSET + 0, +1.0, "translation")],
         "y_pos": [_Bind(base + _XYZ_OFFSET + 1, +1.0, "translation")],
         "y_neg": [_Bind(base + _XYZ_OFFSET + 1, -1.0, "translation")],
         "z_pos": [_Bind(base + _XYZ_OFFSET + 2, +1.0, "translation")],
@@ -341,6 +437,22 @@ def _arm_binds(base: int) -> dict[str, list[_Bind]]:
         "grip_open":  [_Bind(base + _GRIPPER_OFFSET, +1.0, "gripper")],
         "grip_close": [_Bind(base + _GRIPPER_OFFSET, -1.0, "gripper")],
     }
+
+
+# Display ordering for semantic command names.  Used by
+# :py:meth:`KeyboardController.get_active_commands` so callers can render a
+# HUD overlay with a stable, intuitive ordering (translation -> rotation ->
+# gripper) regardless of dict-iteration order.  Keep in sync with
+# :func:`_arm_binds`'s set of semantic keys.
+_SEMANTIC_DISPLAY_ORDER: tuple[str, ...] = (
+    "x_pos", "x_neg",
+    "y_pos", "y_neg",
+    "z_pos", "z_neg",
+    "yaw_pos", "yaw_neg",
+    "pitch_pos", "pitch_neg",
+    "roll_pos", "roll_neg",
+    "grip_open", "grip_close",
+)
 
 
 # Semantic key -> physical pynput key for the LEFT arm (driven by left hand,
@@ -553,17 +665,46 @@ class KeyboardController:
             for bind in self._right_binds[sem]:
                 self._key_to_binds.setdefault(phys, []).append(bind)
 
-        # Modifier and special-purpose keys.
-        self._fast_modifier = pynput_keyboard.Key.shift
-        self._slow_modifier = pynput_keyboard.Key.ctrl
+        # Special-purpose keys.
         self._print_key = "p"
         self._stop_key = pynput_keyboard.Key.esc
+        # Scene-reset binding -- F1.  Setting this raises the
+        # ``reset_requested`` flag (see the property below); callers consume
+        # it via ``consume_reset_request`` to atomically read-and-clear,
+        # which lets them e.g. rebuild a streaming inference KV cache from
+        # the original first frame to recover from accumulated drift.
+        # Unlike ``Esc``, F1 does NOT terminate the listener -- the user
+        # can keep driving the sim immediately after the reset completes.
+        self._reset_key = pynput_keyboard.Key.f1
+
+        # Sticky speed selector -- ``Alt + digit`` swaps the active scalar
+        # in :attr:`ControllerGains.speed_levels`.  We pre-build the
+        # digit-char -> 0-indexed level map here so the listener hot path
+        # is just a dict lookup and an ``if alt in held``.  Length matches
+        # the configured ``speed_levels`` (capped at 9 by ``__post_init__``).
+        _digit_chars = ("1", "2", "3", "4", "5", "6", "7", "8", "9")
+        n_levels = len(self.config.gains.speed_levels)
+        self._speed_digit_keys: dict[str, int] = {
+            _digit_chars[i]: i for i in range(n_levels)
+        }
+        # Mirror left/right Alt under this generic alias so the Alt+digit
+        # check below can do a single membership test regardless of which
+        # physical Alt key the user pressed.  See ``_on_press``.
+        self._alt_alias = pynput_keyboard.Key.alt
 
         # Mutable state guarded by ``_lock``.
         self._lock = threading.Lock()
         self._held_keys: set[object] = set()
         self._listener: Optional[pynput_keyboard.Listener] = None
         self._stop_requested = False
+        self._reset_requested = False
+        # 0-indexed active speed level + cached scalar.  Both mutated by
+        # ``_on_press`` (listener thread), read by ``_build_action_step``
+        # (caller thread) under ``_lock``.
+        self._current_speed_level: int = self.config.gains.default_speed_level - 1
+        self._current_speed_scalar: float = float(
+            self.config.gains.speed_levels[self._current_speed_level]
+        )
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -602,6 +743,81 @@ class KeyboardController:
         """``True`` once the user has pressed Esc (or the stop binding)."""
         return self._stop_requested
 
+    @property
+    def reset_requested(self) -> bool:
+        """``True`` once the user has pressed F1 since the last consume.
+
+        The flag is *sticky*: it stays ``True`` until the caller resets it
+        via :py:meth:`consume_reset_request` (which atomically reads and
+        clears).  This lets a slow consumer (e.g. a per-AR-step inference
+        loop) miss at most one reset between polls but never lose one.
+        """
+        return self._reset_requested
+
+    def consume_reset_request(self) -> bool:
+        """Atomically read-and-clear :py:attr:`reset_requested`.
+
+        Returns ``True`` if a reset had been requested since the last call,
+        and resets the flag so the next call returns ``False`` until the
+        user presses F1 again.  Use this from the main inference loop:
+
+            with KeyboardController() as kbd:
+                while not kbd.stop_requested:
+                    if kbd.consume_reset_request():
+                        ...  # rebuild your scene state
+                    ...
+        """
+        with self._lock:
+            requested = self._reset_requested
+            self._reset_requested = False
+        return requested
+
+    # ------------------------------------------------------------------
+    # Active-command introspection (read-only)
+    # ------------------------------------------------------------------
+
+    def get_active_commands(self) -> dict[str, object]:
+        """Snapshot which semantic commands are currently held.
+
+        Returns a dict with four keys:
+
+            ``"left"`` / ``"right"``
+                Lists of *semantic* command names (the keys of
+                :data:`_LEFT_ARM_KEYMAP` / :data:`_RIGHT_ARM_KEYMAP`,
+                e.g. ``"y_pos"``, ``"yaw_neg"``, ``"grip_close"``) for
+                that arm, ordered to match :data:`_SEMANTIC_DISPLAY_ORDER`.
+            ``"speed_level"``
+                1-indexed integer in ``[1, len(speed_levels)]`` -- which
+                ``Alt+digit`` slot is currently active.
+            ``"speed_scalar"``
+                Float -- the actual multiplier applied to translation
+                and rotation channels (gripper is unaffected).
+
+        The snapshot is consistent across the four entries (taken under
+        the listener lock); an Alt+digit press exactly during the call
+        cannot split between, say, "old scalar was used for left arm
+        but new scalar for right arm".  Intended primarily for live-
+        display overlays such as
+        ``projects/cosmos_h_surgical/run_keyboard.py``'s on-frame
+        command HUD; keep this read-only and side-effect-free.
+        """
+        with self._lock:
+            held = frozenset(self._held_keys)
+            level_one_indexed = self._current_speed_level + 1
+            scalar = self._current_speed_scalar
+
+        def _active_for_arm(keymap: dict) -> list[str]:
+            present = [sem for sem, phys in keymap.items() if phys in held]
+            present_set = set(present)
+            return [sem for sem in _SEMANTIC_DISPLAY_ORDER if sem in present_set]
+
+        return {
+            "left": _active_for_arm(self.config.left_arm_keys),
+            "right": _active_for_arm(self.config.right_arm_keys),
+            "speed_level": level_one_indexed,
+            "speed_scalar": scalar,
+        }
+
     # ------------------------------------------------------------------
     # pynput callbacks (run on the listener thread)
     # ------------------------------------------------------------------
@@ -613,15 +829,47 @@ class KeyboardController:
         if token == self._stop_key:
             self._stop_requested = True
             return False  # tells pynput to stop the listener
+        if token == self._reset_key:
+            # F1: signal the consumer to rebuild scene state.  We do NOT
+            # short-circuit the held-keys bookkeeping below -- F1 is not a
+            # held action key, so it just doesn't appear in any keymap and
+            # would no-op there; storing it in ``_held_keys`` is harmless.
+            with self._lock:
+                self._reset_requested = True
+        # Snapshot inside the lock whether this press changed the active
+        # speed level so we can print a single-line confirmation outside
+        # the lock (avoids holding the listener thread during stdout).
+        speed_change: Optional[tuple[int, float]] = None
         with self._lock:
             self._held_keys.add(token)
-            # Modifier "pair" canonicalisation: pynput emits shift_l/shift_r and
-            # ctrl_l/ctrl_r as distinct keys.  Mirror them under the generic
-            # Key.shift / Key.ctrl tokens so the modifier check below sees them.
-            if token in (pynput_keyboard.Key.shift_l, pynput_keyboard.Key.shift_r):
-                self._held_keys.add(pynput_keyboard.Key.shift)
-            elif token in (pynput_keyboard.Key.ctrl_l, pynput_keyboard.Key.ctrl_r):
-                self._held_keys.add(pynput_keyboard.Key.ctrl)
+            # Mirror left / right Alt under the generic ``Key.alt`` alias
+            # so the Alt+digit check below is a single membership test.
+            # Note we deliberately do NOT mirror ``Key.alt_gr`` (AltGr on
+            # EU layouts) so that AltGr+digit -- a normal way to type
+            # special characters on QWERTZ -- never triggers a speed swap.
+            if token in (pynput_keyboard.Key.alt_l, pynput_keyboard.Key.alt_r):
+                self._held_keys.add(self._alt_alias)
+            # Alt+digit: switch the sticky speed scalar.  Bare digit
+            # presses (no Alt) just sit harmlessly in ``_held_keys`` --
+            # they are not bound to any action.
+            if (
+                isinstance(token, str)
+                and token in self._speed_digit_keys
+                and self._alt_alias in self._held_keys
+            ):
+                new_level = self._speed_digit_keys[token]
+                new_scalar = float(self.config.gains.speed_levels[new_level])
+                if new_level != self._current_speed_level:
+                    speed_change = (new_level + 1, new_scalar)
+                self._current_speed_level = new_level
+                self._current_speed_scalar = new_scalar
+        if speed_change is not None:
+            level_one_indexed, scalar = speed_change
+            print(
+                f"[keyboard_controller] speed level -> {level_one_indexed} "
+                f"({scalar:g}x)",
+                flush=True,
+            )
         if token == self._print_key:
             self._print_snapshot()
         return None
@@ -632,16 +880,14 @@ class KeyboardController:
             return
         with self._lock:
             self._held_keys.discard(token)
-            # Mirror modifier pairs: only clear the generic alias when BOTH
-            # left/right variants are released.
-            if token in (pynput_keyboard.Key.shift_l, pynput_keyboard.Key.shift_r):
-                if (pynput_keyboard.Key.shift_l not in self._held_keys
-                        and pynput_keyboard.Key.shift_r not in self._held_keys):
-                    self._held_keys.discard(pynput_keyboard.Key.shift)
-            elif token in (pynput_keyboard.Key.ctrl_l, pynput_keyboard.Key.ctrl_r):
-                if (pynput_keyboard.Key.ctrl_l not in self._held_keys
-                        and pynput_keyboard.Key.ctrl_r not in self._held_keys):
-                    self._held_keys.discard(pynput_keyboard.Key.ctrl)
+            # Mirror Alt pair: only clear the generic alias when BOTH
+            # left and right Alt variants have been released.
+            if token in (pynput_keyboard.Key.alt_l, pynput_keyboard.Key.alt_r):
+                if (
+                    pynput_keyboard.Key.alt_l not in self._held_keys
+                    and pynput_keyboard.Key.alt_r not in self._held_keys
+                ):
+                    self._held_keys.discard(self._alt_alias)
 
     # ------------------------------------------------------------------
     # Action sampling (called by the simulator main loop)
@@ -659,13 +905,10 @@ class KeyboardController:
         gains = self.config.gains
         with self._lock:
             held = frozenset(self._held_keys)
-
-        # Determine modifier scaling for non-gripper channels.
-        modifier = 1.0
-        if self._fast_modifier in held:
-            modifier *= gains.fast_multiplier
-        if self._slow_modifier in held:
-            modifier *= gains.slow_multiplier
+            # Snapshot the active speed scalar atomically with the held
+            # set so a concurrent Alt+digit press cannot split the read
+            # ("which scalar applied to which key") across a step.
+            speed = self._current_speed_scalar
 
         action = np.zeros(DVRK_RAW_DIM, dtype=np.float32)
 
@@ -682,11 +925,11 @@ class KeyboardController:
                         gain = gains.translation_z
                     else:
                         gain = gains.translation_xy
-                    action[bind.dim] += bind.coef * gain * modifier
+                    action[bind.dim] += bind.coef * gain * speed
                 elif bind.kind == "rotation":
-                    action[bind.dim] += bind.coef * gains.rotation * modifier
+                    action[bind.dim] += bind.coef * gains.rotation * speed
                 elif bind.kind == "gripper":
-                    # Absolute target, NOT scaled by speed modifiers.
+                    # Absolute target, NOT scaled by the speed selector.
                     # If both open and close are pressed, sum to ~0.
                     action[bind.dim] += bind.coef * gains.gripper
 
@@ -762,11 +1005,20 @@ class KeyboardController:
             "    N / M         : roll  -/+   [rot6d dim   8]",
             "    R-Shift       : gripper close (hold)",
             "    R-Ctrl        : gripper open  (hold)",
-            "  Modifiers (apply to motion + rotation, NOT gripper):",
-            f"    L-Shift       : x{self.config.gains.fast_multiplier:g} speed",
-            f"    L-Ctrl        : x{self.config.gains.slow_multiplier:g} speed (precision)",
+            "  Speed levels (sticky; apply to motion + rotation, NOT gripper):",
+        ]
+        levels = self.config.gains.speed_levels
+        default_one_indexed = self.config.gains.default_speed_level
+        for i, scalar in enumerate(levels):
+            marker = "  <- startup default" if (i + 1) == default_one_indexed else ""
+            lines.append(f"    Alt+{i + 1}         : x{scalar:g}{marker}")
+        lines += [
+            "    (left or right Alt; AltGr is excluded)",
             "  Misc:",
             "    P             : print current 20-D action snapshot",
+            "    F1            : reset scene to initial first frame "
+            "(consumer-side, e.g. to rebuild an inference KV cache and "
+            "shake off accumulated drift; does NOT exit the listener)",
             "    Esc           : stop / exit",
         ]
         return "\n".join(lines)
