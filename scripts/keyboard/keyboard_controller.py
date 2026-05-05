@@ -69,8 +69,22 @@ RIGHT hand drives the RIGHT (camera-frame) arm:
     U / O               yaw   - / +    (rot6d delta: dims 4, 6)
     J / L               pitch + / -    (rot6d delta: dim 5)
     N / M               roll  - / +    (rot6d delta: dim 8)
-    Right Shift         gripper close (hold)
-    Right Ctrl          gripper open  (hold)
+    Right Shift         gripper close (latched -- see Gripper mode)
+    Right Ctrl          gripper open  (latched -- see Gripper mode)
+
+Gripper mode (``KeyboardControllerConfig.gripper_mode``, default ``"latch"``):
+    The gripper channels (dims 9 / 19) are *absolute* opening targets
+    in sigma units, unlike the *relative* xyz / rot6d channels.  A
+    "do nothing this frame" gripper command is therefore NOT 0 sigma
+    -- 0 sigma maps to the dataset-mean opening, so emitting 0 actively
+    drives the jaws to mid-position.  In ``"latch"`` mode each gripper
+    key press updates a per-arm sticky state in {open, closed} that is
+    re-emitted on every action step until the opposite gripper key on
+    that arm is pressed (or F1 resets the scene), so e.g. pressing
+    Right-Ctrl once + holding Up-arrow keeps the right gripper open
+    while the arm moves up.  In ``"momentary"`` mode the legacy held-
+    only behaviour is used (release the gripper key -> channel returns
+    to 0 sigma -> jaws snap to mean).
 
 Speed levels (sticky, apply to motion + rotation, NOT gripper):
     Alt+1 .. Alt+4   Switch the per-held-key speed multiplier between 4
@@ -530,6 +544,7 @@ def _normalise_key(key) -> object:
 # ---------------------------------------------------------------------------
 
 _VALID_LAYOUTS = ("qwerty", "qwertz")
+_VALID_GRIPPER_MODES = ("latch", "momentary")
 
 
 @dataclass
@@ -554,6 +569,25 @@ class KeyboardControllerConfig:
             so the same physical keys remain reachable from the WASD
             cluster.  Non-character bindings (arrows, Shift, Space, Ctrl,
             Esc) are layout-independent and unaffected.
+        gripper_mode: ``"latch"`` (default) or ``"momentary"``.  Controls
+            how the absolute gripper channels (dims 9 / 19) are driven:
+
+            * ``"latch"``: each gripper key press updates a per-arm sticky
+              state in {open, closed} that persists until the opposite
+              gripper key is pressed (or F1 resets the scene).  The
+              gripper sigma value is then re-emitted on every action
+              step regardless of whether any key is held.  This is the
+              correct behaviour for the JHU dVRK action space because
+              ``gripper`` is an *absolute* opening target and 0 sigma
+              maps to the dataset-mean opening, not to "do nothing";
+              releasing the gripper key in momentary mode therefore
+              snaps the jaws back to the mean.  Per-arm states default
+              to ``neutral`` (gripper = 0 sigma) at startup and on F1.
+            * ``"momentary"``: legacy held-only behaviour -- gripper
+              sigma is +/- gain ONLY while the open / close key is
+              physically held; release a key and the channel returns to
+              0 sigma, which the model interprets as "drive the jaws to
+              the mean opening".  Kept for backward compatibility.
         left_arm_keys: Override the LEFT-arm semantic-key -> physical-key
             map (advanced).  Applied AFTER the ``keyboard_layout`` swap.
         right_arm_keys: Override the RIGHT-arm semantic-key -> physical-key
@@ -564,6 +598,7 @@ class KeyboardControllerConfig:
     action_dim: int = MAX_ACTION_DIM
     gains: ControllerGains = field(default_factory=ControllerGains)
     keyboard_layout: str = "qwerty"
+    gripper_mode: str = "latch"
     left_arm_keys: dict[str, object] = field(
         default_factory=lambda: dict(_LEFT_ARM_KEYMAP)
     )
@@ -576,6 +611,11 @@ class KeyboardControllerConfig:
             raise ValueError(
                 f"Unknown keyboard_layout {self.keyboard_layout!r}; "
                 f"must be one of {_VALID_LAYOUTS}"
+            )
+        if self.gripper_mode not in _VALID_GRIPPER_MODES:
+            raise ValueError(
+                f"Unknown gripper_mode {self.gripper_mode!r}; "
+                f"must be one of {_VALID_GRIPPER_MODES}"
             )
         if self.keyboard_layout == "qwertz":
             # On QWERTZ, the "Y" and "Z" physical keys are swapped relative
@@ -654,16 +694,29 @@ class KeyboardController:
         # action dims (e.g. yaw -> two rot6d dims) - both cases collapse
         # into the same flat list.
         self._key_to_binds: dict[object, list[_Bind]] = {}
+        # Sticky-gripper reverse-lookup: physical key -> ("left" | "right",
+        # +1 (open) | -1 (close)).  Populated from grip_open / grip_close
+        # entries in each arm's keymap so ``_on_press`` can update the
+        # latched per-arm state in O(1).  Non-gripper keys are absent.
+        self._gripper_keys: dict[object, tuple[str, int]] = {}
         for sem, phys in self.config.left_arm_keys.items():
             if sem not in self._left_binds:
                 raise ValueError(f"Unknown LEFT-arm semantic key '{sem}'")
             for bind in self._left_binds[sem]:
                 self._key_to_binds.setdefault(phys, []).append(bind)
+            if sem == "grip_open":
+                self._gripper_keys[phys] = ("left", +1)
+            elif sem == "grip_close":
+                self._gripper_keys[phys] = ("left", -1)
         for sem, phys in self.config.right_arm_keys.items():
             if sem not in self._right_binds:
                 raise ValueError(f"Unknown RIGHT-arm semantic key '{sem}'")
             for bind in self._right_binds[sem]:
                 self._key_to_binds.setdefault(phys, []).append(bind)
+            if sem == "grip_open":
+                self._gripper_keys[phys] = ("right", +1)
+            elif sem == "grip_close":
+                self._gripper_keys[phys] = ("right", -1)
 
         # Special-purpose keys.
         self._print_key = "p"
@@ -705,6 +758,14 @@ class KeyboardController:
         self._current_speed_scalar: float = float(
             self.config.gains.speed_levels[self._current_speed_level]
         )
+        # Per-arm latched gripper state in {-1 (closed), 0 (neutral), +1
+        # (open)}.  Updated by ``_on_press`` whenever a gripper key on
+        # that arm is pressed; cleared back to 0 on F1 (scene reset).
+        # Read by ``_build_action_step`` only when ``gripper_mode ==
+        # "latch"`` -- in ``"momentary"`` mode the legacy held-only
+        # gripper logic runs and these values are bookkeeping-only.
+        self._left_grip_state: int = 0
+        self._right_grip_state: int = 0
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -779,7 +840,7 @@ class KeyboardController:
     def get_active_commands(self) -> dict[str, object]:
         """Snapshot which semantic commands are currently held.
 
-        Returns a dict with four keys:
+        Returns a dict with six keys:
 
             ``"left"`` / ``"right"``
                 Lists of *semantic* command names (the keys of
@@ -792,12 +853,20 @@ class KeyboardController:
             ``"speed_scalar"``
                 Float -- the actual multiplier applied to translation
                 and rotation channels (gripper is unaffected).
+            ``"left_gripper"`` / ``"right_gripper"``
+                One of ``"open"``, ``"closed"``, ``"neutral"`` -- the
+                current per-arm latched gripper state.  In ``"latch"``
+                gripper mode this is what is actually emitted on the
+                gripper channel every frame; in ``"momentary"`` mode the
+                value is bookkeeping-only (the held-key gripper logic is
+                what drives the channel) but the snapshot still
+                reflects the most recent press.
 
-        The snapshot is consistent across the four entries (taken under
-        the listener lock); an Alt+digit press exactly during the call
-        cannot split between, say, "old scalar was used for left arm
-        but new scalar for right arm".  Intended primarily for live-
-        display overlays such as
+        The snapshot is consistent across all entries (taken under the
+        listener lock); a key press exactly during the call cannot
+        split between, say, "old scalar was used for left arm but new
+        scalar for right arm".  Intended primarily for live-display
+        overlays such as
         ``projects/cosmos_h_surgical/run_keyboard.py``'s on-frame
         command HUD; keep this read-only and side-effect-free.
         """
@@ -805,17 +874,24 @@ class KeyboardController:
             held = frozenset(self._held_keys)
             level_one_indexed = self._current_speed_level + 1
             scalar = self._current_speed_scalar
+            left_grip = self._left_grip_state
+            right_grip = self._right_grip_state
 
         def _active_for_arm(keymap: dict) -> list[str]:
             present = [sem for sem, phys in keymap.items() if phys in held]
             present_set = set(present)
             return [sem for sem in _SEMANTIC_DISPLAY_ORDER if sem in present_set]
 
+        def _grip_label(state: int) -> str:
+            return {-1: "closed", 0: "neutral", +1: "open"}[state]
+
         return {
             "left": _active_for_arm(self.config.left_arm_keys),
             "right": _active_for_arm(self.config.right_arm_keys),
             "speed_level": level_one_indexed,
             "speed_scalar": scalar,
+            "left_gripper": _grip_label(left_grip),
+            "right_gripper": _grip_label(right_grip),
         }
 
     # ------------------------------------------------------------------
@@ -829,18 +905,26 @@ class KeyboardController:
         if token == self._stop_key:
             self._stop_requested = True
             return False  # tells pynput to stop the listener
-        if token == self._reset_key:
-            # F1: signal the consumer to rebuild scene state.  We do NOT
-            # short-circuit the held-keys bookkeeping below -- F1 is not a
-            # held action key, so it just doesn't appear in any keymap and
-            # would no-op there; storing it in ``_held_keys`` is harmless.
-            with self._lock:
-                self._reset_requested = True
         # Snapshot inside the lock whether this press changed the active
-        # speed level so we can print a single-line confirmation outside
-        # the lock (avoids holding the listener thread during stdout).
+        # speed level / gripper latch so we can print a single-line
+        # confirmation outside the lock (avoids holding the listener
+        # thread during stdout).
         speed_change: Optional[tuple[int, float]] = None
+        gripper_change: Optional[tuple[str, int, int]] = None  # (arm, old, new)
+        reset_change: bool = False
         with self._lock:
+            if token == self._reset_key:
+                # F1: signal the consumer to rebuild scene state.  Also
+                # clear both arms' latched gripper state so the rebuilt
+                # scene starts at the same neutral baseline as a fresh
+                # process (otherwise the freshly-rendered first frame
+                # would be overwritten by a stale latched-open / -closed
+                # gripper command on the very next AR step).
+                self._reset_requested = True
+                if self._left_grip_state != 0 or self._right_grip_state != 0:
+                    reset_change = True
+                self._left_grip_state = 0
+                self._right_grip_state = 0
             self._held_keys.add(token)
             # Mirror left / right Alt under the generic ``Key.alt`` alias
             # so the Alt+digit check below is a single membership test.
@@ -863,11 +947,38 @@ class KeyboardController:
                     speed_change = (new_level + 1, new_scalar)
                 self._current_speed_level = new_level
                 self._current_speed_scalar = new_scalar
+            # Sticky-gripper update.  We always update the latched state
+            # (cheap; lets the user switch ``gripper_mode`` mid-run via
+            # the API without losing state); it is only *consumed* by
+            # ``_build_action_step`` when ``gripper_mode == "latch"``.
+            if token in self._gripper_keys:
+                arm, sign = self._gripper_keys[token]
+                if arm == "left":
+                    if self._left_grip_state != sign:
+                        gripper_change = ("LEFT", self._left_grip_state, sign)
+                    self._left_grip_state = sign
+                else:
+                    if self._right_grip_state != sign:
+                        gripper_change = ("RIGHT", self._right_grip_state, sign)
+                    self._right_grip_state = sign
         if speed_change is not None:
             level_one_indexed, scalar = speed_change
             print(
                 f"[keyboard_controller] speed level -> {level_one_indexed} "
                 f"({scalar:g}x)",
+                flush=True,
+            )
+        if gripper_change is not None and self.config.gripper_mode == "latch":
+            arm, _old, new = gripper_change
+            label = {-1: "CLOSED", 0: "neutral", +1: "OPEN"}[new]
+            print(
+                f"[keyboard_controller] {arm} gripper latched -> {label}",
+                flush=True,
+            )
+        if reset_change and self.config.gripper_mode == "latch":
+            print(
+                "[keyboard_controller] F1: cleared latched gripper state "
+                "(both arms -> neutral)",
                 flush=True,
             )
         if token == self._print_key:
@@ -898,17 +1009,40 @@ class KeyboardController:
 
         Returns:
             ``(DVRK_RAW_DIM,)`` ``float32`` vector in normalised space.
-            Translation / rotation channels are signed sigma offsets;
-            gripper channels are absolute targets that decay back to 0
-            (= mean opening) when no gripper key is held.
+            Translation / rotation channels are signed sigma offsets
+            (zero when no key is held = "do not move this frame", which
+            matches their *relative* training-time semantics).  Gripper
+            channels are *absolute* opening targets in sigma units.
+
+            How the gripper channel is filled depends on
+            :attr:`KeyboardControllerConfig.gripper_mode`:
+
+            * ``"latch"`` (default): the per-arm latched state set by
+              the most recent gripper key press on that arm is emitted
+              every frame (``+gripper`` open, ``-gripper`` closed,
+              ``0`` neutral / pre-first-press / post-F1).  This is the
+              correct behaviour for the absolute gripper channel --
+              gripper=0 in the training data is the *dataset-mean*
+              opening, not a no-op, so a momentary release would snap
+              the jaws back to mid-position mid-trajectory.
+            * ``"momentary"``: legacy held-only behaviour; ``+gripper``
+              while the open key is physically held, ``-gripper`` while
+              close is held, sum to ~0 if both are held, ``0`` (= mean
+              opening) when neither is held.
         """
         gains = self.config.gains
+        latch_mode = self.config.gripper_mode == "latch"
         with self._lock:
             held = frozenset(self._held_keys)
             # Snapshot the active speed scalar atomically with the held
             # set so a concurrent Alt+digit press cannot split the read
             # ("which scalar applied to which key") across a step.
             speed = self._current_speed_scalar
+            # Same atomicity argument applies to the gripper latch
+            # state: a press during this snapshot must not split between
+            # the held set and the latch.
+            left_grip = self._left_grip_state
+            right_grip = self._right_grip_state
 
         action = np.zeros(DVRK_RAW_DIM, dtype=np.float32)
 
@@ -929,9 +1063,21 @@ class KeyboardController:
                 elif bind.kind == "rotation":
                     action[bind.dim] += bind.coef * gains.rotation * speed
                 elif bind.kind == "gripper":
-                    # Absolute target, NOT scaled by the speed selector.
-                    # If both open and close are pressed, sum to ~0.
+                    if latch_mode:
+                        # In latch mode we ignore held gripper keys
+                        # here -- the latched state below is the single
+                        # source of truth for gripper sigma so the user
+                        # can press a non-gripper key without snapping
+                        # the jaws back to mean.
+                        continue
+                    # Momentary: absolute target, NOT scaled by the speed
+                    # selector.  If both open and close are pressed,
+                    # they sum to ~0.
                     action[bind.dim] += bind.coef * gains.gripper
+
+        if latch_mode:
+            action[_LEFT_BASE + _GRIPPER_OFFSET] = left_grip * gains.gripper
+            action[_RIGHT_BASE + _GRIPPER_OFFSET] = right_grip * gains.gripper
 
         return action
 
@@ -994,8 +1140,8 @@ class KeyboardController:
             "    Q / E         : yaw  -/+    [rot6d dims 14, 16]",
             "    T / G         : pitch +/-   [rot6d dim  15]",
             "    C / V         : roll  -/+   [rot6d dim  18]",
-            "    Space         : gripper close (hold)",
-            f"    {grip_open_left}             : gripper open  (hold)",
+            "    Space         : gripper close",
+            f"    {grip_open_left}             : gripper open",
             "  RIGHT arm (camera-frame right / PSM1, dims 0-9):",
             "    Up / Down     : y +/-",
             "    Left / Right  : x -/+",
@@ -1003,8 +1149,26 @@ class KeyboardController:
             "    U / O         : yaw  -/+    [rot6d dims  4,  6]",
             "    J / L         : pitch +/-   [rot6d dim   5]",
             "    N / M         : roll  -/+   [rot6d dim   8]",
-            "    R-Shift       : gripper close (hold)",
-            "    R-Ctrl        : gripper open  (hold)",
+            "    R-Shift       : gripper close",
+            "    R-Ctrl        : gripper open",
+        ]
+        if self.config.gripper_mode == "latch":
+            lines += [
+                "  Gripper mode  : LATCH  (each gripper key press sticks "
+                "until the opposite gripper key on that arm is pressed; F1 "
+                "resets both arms to neutral).  Required for the absolute "
+                "gripper channel: 0 sigma = dataset-mean opening, NOT a "
+                "no-op, so a momentary release would snap the jaws to "
+                "mid-position.",
+            ]
+        else:
+            lines += [
+                "  Gripper mode  : MOMENTARY  (gripper channel is +/- gain "
+                "ONLY while the open / close key is physically held; "
+                "release returns to 0 sigma = dataset-mean opening, which "
+                "the model will visibly drive towards).",
+            ]
+        lines += [
             "  Speed levels (sticky; apply to motion + rotation, NOT gripper):",
         ]
         levels = self.config.gains.speed_levels
